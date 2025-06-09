@@ -7,21 +7,21 @@ from src.gfootball_agent.agent import agent
 from src.gfootball_agent.config import Action, PlayerRole
 import time
 
-def create_environment():
+def create_environment(args):
     """创建Google Research Football环境"""
     env = football_env.create_environment(
-        env_name='11_vs_11_stochastic',  # 11v11随机环境
-        representation='raw',            # 使用原始观测数据
-        rewards='scoring',               # 使用得分奖励
-        write_goal_dumps=False,          # 不写入进球录像
-        write_full_episode_dumps=False,  # 不写入完整回合录像
-        render=True,                     # 启用渲染以便观察
-        write_video=False,               # 不录制视频
-        dump_frequency=0,                # 不定期保存
-        logdir='',                       # 不设置日志目录
-        extra_players=None,              # 不添加额外玩家
-        number_of_left_players_agent_controls=11,  # 控制左队全部11名球员
-        number_of_right_players_agent_controls=0   # 不控制右队球员
+        env_name=args.env_name,
+        representation=args.representation,
+        rewards=args.rewards,
+        write_goal_dumps=False,
+        write_full_episode_dumps=False,
+        render=args.render,
+        write_video=args.write_video,
+        dump_frequency=0,
+        logdir=args.logdir,
+        extra_players=None,
+        number_of_left_players_agent_controls=11,
+        number_of_right_players_agent_controls=0
     )
     return env
 
@@ -98,21 +98,19 @@ def run_episode(env, max_steps=3000):
     return episode_reward, episode_length
 
 
-def main():
+def main(args):
     """主函数"""
     print("初始化Google Research Football环境...")
     
     # 创建环境
-    env = create_environment()
+    env = create_environment(args)
     print("环境创建成功!")
     
     # 运行比赛
-    num_episodes = 1  # 可以调整比赛局数
-    
-    for episode in range(num_episodes):
+    for episode in range(args.num_episodes):
         print(f"\n=== 第 {episode + 1} 局比赛 ===")
         
-        episode_reward, episode_length = run_episode(env)
+        episode_reward, episode_length = run_episode(env, args.max_steps)
         
         print(f"第 {episode + 1} 局结束:")
         print(f"  总奖励: {episode_reward:.3f}")

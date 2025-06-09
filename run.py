@@ -6,12 +6,39 @@
 
 import sys
 import os
+import argparse
 
 # 添加当前目录到Python路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 导入主函数
 from src.main import main
+
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='Google Research Football 决策树智能体')
+    
+    # 环境配置参数
+    parser.add_argument('--env_name', type=str, default='11_vs_11_stochastic',
+                      help='环境名称 (默认: 11_vs_11_stochastic)')
+    parser.add_argument('--representation', type=str, default='raw',
+                      help='观测数据表示方式 (默认: raw)')
+    parser.add_argument('--rewards', type=str, default='scoring',
+                      help='奖励类型 (默认: scoring)')
+    parser.add_argument('--render', action='store_true',
+                      help='是否启用渲染 (默认: False)')
+    parser.add_argument('--write_video', action='store_true',
+                      help='是否录制视频 (默认: False)')
+    parser.add_argument('--logdir', type=str, default='',
+                      help='日志目录 (默认: 空)')
+    
+    # 运行配置参数
+    parser.add_argument('--num_episodes', type=int, default=1,
+                      help='运行比赛局数 (默认: 1)')
+    parser.add_argument('--max_steps', type=int, default=3000,
+                      help='每局最大步数 (默认: 3000)')
+    
+    return parser.parse_args()
 
 if __name__ == "__main__":
     print("=" * 60)
@@ -23,4 +50,21 @@ if __name__ == "__main__":
     print("3. 安装了必要的依赖包 (numpy等)")
     print("=" * 60)
     
-    main()
+    # 解析命令行参数
+    args = parse_args()
+    
+    # 打印配置信息
+    print("环境配置:")
+    print(f"  环境名称: {args.env_name}")
+    print(f"  表示方式: {args.representation}")
+    print(f"  奖励类型: {args.rewards}")
+    print(f"  渲染模式: {'启用' if args.render else '禁用'}")
+    print(f"  视频录制: {'启用' if args.write_video else '禁用'}")
+    print(f"  日志目录: {args.logdir if args.logdir else '无'}")
+    print(f"运行配置:")
+    print(f"  比赛局数: {args.num_episodes}")
+    print(f"  最大步数: {args.max_steps}")
+    print("=" * 60)
+    
+    # 运行主程序
+    main(args)
