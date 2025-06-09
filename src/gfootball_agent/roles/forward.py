@@ -205,27 +205,44 @@ def forward_off_ball_movement(obs, player_index, player_info):
 
 
 def forward_attacking_run(obs, player_index, player_info, ball_pos):
-    """前锋在对方半场的跑位"""
+    """前锋在对方半场的跑位 - 优化版本，创造更好的传球选项"""
     player_pos = player_info['position']
     goal_center = [Field.RIGHT_GOAL_X, Field.CENTER_Y]
     
-    # 寻找最佳的接球位置
-    best_position = find_best_receiving_position(obs, player_index, ball_pos)
+    # 获取持球球员信息
+    ball_info = get_ball_info(obs)
+    ball_carrier_index = ball_info['owned_player']
     
-    if best_position:
-        movement_action = get_movement_direction(player_pos, best_position)
+    # 根据持球球员位置调整跑位策略
+    if ball_carrier_index != -1:
+        ball_carrier_pos = obs['left_team'][ball_carrier_index]
+        ball_carrier_role = obs['left_team_roles'][ball_carrier_index]
         
-        # 如果距离较远，使用冲刺
-        distance_to_target = distance_to(player_pos, best_position)
-        if distance_to_target > 0.1 and not is_player_tired(obs, player_index):
-            return Action.SPRINT
+        # 寻找最佳的接球位置，考虑创造传球线路
+        best_position = find_best_receiving_position_enhanced(obs, player_index, ball_pos, ball_carrier_pos)
         
+        if best_position:
+            movement_action = get_movement_direction(player_pos, best_position)
+            
+            # 如果距离较远，使用冲刺
+            distance_to_target = distance_to(player_pos, best_position)
+            if distance_to_target > 0.08 and not is_player_tired(obs, player_index):
+                return Action.SPRINT
+            
+            if movement_action:
+                return movement_action
+    
+    # 默认智能跑位：寻找防守空隙
+    target_position = find_defensive_gap(obs, player_index, ball_pos)
+    
+    if target_position:
+        movement_action = get_movement_direction(player_pos, target_position)
         if movement_action:
             return movement_action
     
-    # 默认向球门区域移动
-    target_x = min(ball_pos[0] + 0.1, Field.RIGHT_GOAL_X - 0.1)
-    target_y = 0  # 保持在中路
+    # 兜底：向球门区域移动但避免越位
+    target_x = min(ball_pos[0] + 0.08, Field.RIGHT_GOAL_X - 0.12)
+    target_y = calculate_optimal_y_position(obs, player_pos, ball_pos)
     
     target_pos = [target_x, target_y]
     movement_action = get_movement_direction(player_pos, target_pos)
@@ -460,6 +477,216 @@ def find_best_receiving_position(obs, player_index, ball_pos):
             best_position = pos
     
     return best_position
+
+
+def find_best_receiving_position_enhanced(obs, player_index, ball_pos, ball_carrier_pos):
+    """增强版寻找最佳接球位置，考虑传球线路"""
+    player_pos = obs['left_team'][player_index]
+    goal_center = [Field.RIGHT_GOAL_X, Field.CENTER_Y]
+    
+    # 扩展候选位置，包括更多的跑位选项
+    candidate_positions = []
+    
+    # 前插到防守线身后
+    for x_offset in [0.1, 0.12, 0.15]:
+        for y_offset in [-0.05, 0, 0.05]:
+            pos = [ball_pos[0] + x_offset, ball_pos[1] + y_offset]
+            candidate_positions.append(pos)
+    
+    # 肋部跑位（防守队员之间的空隙）
+    for y_offset in [-0.1, -0.15, 0.1, 0.15]:
+        pos = [ball_pos[0] + 0.08, ball_pos[1] + y_offset]
+        candidate_positions.append(pos)
+    
+    # 回撤接球（如果前方压力太大）
+    if is_too_crowded_ahead(obs, ball_pos):
+        for x_offset in [-0.02, -0.05]:
+            for y_offset in [-0.08, 0, 0.08]:
+                pos = [ball_carrier_pos[0] + x_offset, ball_carrier_pos[1] + y_offset]
+                candidate_positions.append(pos)
+    
+    best_position = None
+    best_score = -1
+    
+    for pos in candidate_positions:
+        # 确保位置在场地内且合理
+        if pos[0] > Field.RIGHT_BOUNDARY or pos[0] < Field.LEFT_BOUNDARY:
+            continue
+        if pos[1] > Field.BOTTOM_BOUNDARY or pos[1] < Field.TOP_BOUNDARY:
+            continue
+        if pos[0] < ball_carrier_pos[0] - 0.05:  # 避免过度回撤
+            continue
+        
+        # 计算综合评分
+        score = calculate_receiving_position_score(obs, pos, player_pos, ball_carrier_pos, goal_center)
+        
+        if score > best_score:
+            best_score = score
+            best_position = pos
+    
+    return best_position
+
+
+def calculate_receiving_position_score(obs, position, current_pos, ball_carrier_pos, goal_center):
+    """计算接球位置的评分"""
+    score = 0
+    
+    # 1. 距离球门越近越好（主要因素）
+    distance_to_goal = distance_to(position, goal_center)
+    score += (1.5 - distance_to_goal) * 3
+    
+    # 2. 与对手的距离（安全性）
+    min_distance_to_opponent = min(distance_to(position, opp_pos) for opp_pos in obs['right_team'])
+    score += min_distance_to_opponent * 4
+    
+    # 3. 传球路线的清晰度
+    from src.utils.features import check_pass_path_clear
+    if check_pass_path_clear(ball_carrier_pos, position, obs['right_team']):
+        score += 2.0
+    else:
+        score -= 1.0
+    
+    # 4. 移动距离的合理性
+    move_distance = distance_to(current_pos, position)
+    if move_distance > 0.2:
+        score -= 1.0  # 移动距离太远扣分
+    elif move_distance < 0.05:
+        score -= 0.5  # 移动距离太近也不好
+    
+    # 5. 位置的战术价值
+    if position[0] > ball_carrier_pos[0] + 0.05:  # 向前跑位奖励
+        score += 1.5
+    
+    # 6. 避免越位
+    if is_offside_position(obs, position):
+        score -= 3.0
+    
+    # 7. 射门角度
+    shot_angle = calculate_shot_angle(position, goal_center)
+    if shot_angle < 45:  # 好的射门角度
+        score += 1.0
+    
+    return score
+
+
+def find_defensive_gap(obs, player_index, ball_pos):
+    """寻找防守空隙"""
+    player_pos = obs['left_team'][player_index]
+    
+    # 分析对手防线
+    defenders = []
+    for i, opp_pos in enumerate(obs['right_team']):
+        role = obs['right_team_roles'][i]
+        if role in [PlayerRole.CENTRE_BACK, PlayerRole.LEFT_BACK, PlayerRole.RIGHT_BACK]:
+            defenders.append(opp_pos)
+    
+    if len(defenders) < 2:
+        return None
+    
+    # 寻找防守队员之间的空隙
+    gaps = []
+    for i in range(len(defenders)):
+        for j in range(i + 1, len(defenders)):
+            gap_center = [
+                (defenders[i][0] + defenders[j][0]) / 2,
+                (defenders[i][1] + defenders[j][1]) / 2
+            ]
+            gap_width = distance_to(defenders[i], defenders[j])
+            
+            if gap_width > 0.15:  # 足够大的空隙
+                gaps.append((gap_center, gap_width))
+    
+    # 选择最好的空隙
+    best_gap = None
+    best_score = -1
+    
+    for gap_center, gap_width in gaps:
+        # 确保空隙在前方
+        if gap_center[0] <= ball_pos[0]:
+            continue
+        
+        score = gap_width * 2  # 空隙越大越好
+        score += (gap_center[0] - ball_pos[0])  # 越靠前越好
+        
+        # 考虑到达空隙的难度
+        distance_to_gap = distance_to(player_pos, gap_center)
+        if distance_to_gap < 0.2:
+            score += 0.5
+        
+        if score > best_score:
+            best_score = score
+            best_gap = gap_center
+    
+    return best_gap
+
+
+def calculate_optimal_y_position(obs, player_pos, ball_pos):
+    """计算最优的Y轴位置"""
+    # 分析场上的分布，避免扎堆
+    teammates_y = []
+    for i, teammate_pos in enumerate(obs['left_team']):
+        if obs['left_team_active'][i] and teammate_pos[0] > Field.CENTER_X - 0.1:
+            teammates_y.append(teammate_pos[1])
+    
+    # 寻找人员稀少的区域
+    y_positions = [-0.2, -0.1, 0, 0.1, 0.2]
+    best_y = 0
+    max_space = -1
+    
+    for y in y_positions:
+        space = min(abs(y - teammate_y) for teammate_y in teammates_y) if teammates_y else 1.0
+        if space > max_space:
+            max_space = space
+            best_y = y
+    
+    return best_y
+
+
+def is_too_crowded_ahead(obs, ball_pos):
+    """判断前方是否过于拥挤"""
+    crowded_area_count = 0
+    for opp_pos in obs['right_team']:
+        if (opp_pos[0] > ball_pos[0] and 
+            opp_pos[0] < ball_pos[0] + 0.15 and
+            abs(opp_pos[1] - ball_pos[1]) < 0.2):
+            crowded_area_count += 1
+    
+    return crowded_area_count >= 3
+
+
+def is_offside_position(obs, position):
+    """简单的越位判断"""
+    # 找到最后一名对方防守球员的位置
+    last_defender_x = min(opp_pos[0] for opp_pos in obs['right_team'])
+    
+    # 如果前锋位置超过最后一名防守球员，可能越位
+    return position[0] > last_defender_x - 0.02
+
+
+def calculate_shot_angle(position, goal_center):
+    """计算射门角度"""
+    goal_posts = [[Field.RIGHT_GOAL_X, 0.044], [Field.RIGHT_GOAL_X, -0.044]]
+    
+    # 计算到两个门柱的角度
+    vector1 = [goal_posts[0][0] - position[0], goal_posts[0][1] - position[1]]
+    vector2 = [goal_posts[1][0] - position[0], goal_posts[1][1] - position[1]]
+    
+    # 计算夹角
+    import math
+    dot_product = vector1[0] * vector2[0] + vector1[1] * vector2[1]
+    magnitude1 = (vector1[0]**2 + vector1[1]**2)**0.5
+    magnitude2 = (vector2[0]**2 + vector2[1]**2)**0.5
+    
+    if magnitude1 == 0 or magnitude2 == 0:
+        return 0
+    
+    cos_angle = dot_product / (magnitude1 * magnitude2)
+    cos_angle = max(-1, min(1, cos_angle))  # 防止数值误差
+    
+    angle_rad = math.acos(cos_angle)
+    angle_deg = math.degrees(angle_rad)
+    
+    return angle_deg
 
 
 def should_forward_pressure(obs, player_index, ball_pos):

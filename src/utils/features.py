@@ -109,13 +109,13 @@ def can_shoot(player_pos, ball_pos, obs):
     distance_to_goal = distance_to(player_pos, goal_center)
     
     # 距离球门太远不适合射门
-    from ..gfootball_agent.config import Distance
+    from src.gfootball_agent.config import Distance
     if distance_to_goal > Distance.SHOT_RANGE:
         return False
     
     # 检查射门角度
     shot_angle = abs(angle_to_goal(player_pos))
-    from ..gfootball_agent.config import Angle
+    from src.gfootball_agent.config import Angle
     if shot_angle > Angle.SHOT_ANGLE_THRESHOLD:
         return False
     
@@ -123,7 +123,7 @@ def can_shoot(player_pos, ball_pos, obs):
 
 
 def get_best_pass_target(obs, player_index):
-    """找到最佳的传球目标"""
+    """找到最佳的传球目标 - 优化版本，更加激进的前传"""
     player_pos = obs['left_team'][player_index]
     ball_info = get_ball_info(obs)
     
@@ -140,31 +140,234 @@ def get_best_pass_target(obs, player_index):
         # 计算传球距离
         pass_distance = distance_to(player_pos, teammate_pos)
         
-        # 计算队友是否在更好的位置（更靠近对方球门）
+        # 计算向前推进的程度
         forward_progress = teammate_pos[0] - player_pos[0]
         
-        # 检查是否有对手阻挡传球路线
+        # 检查传球路线是否清晰
         is_clear_path = check_pass_path_clear(player_pos, teammate_pos, obs['right_team'])
         
-        # 综合评分
-        score = 0
-        if forward_progress > 0:  # 向前传球加分
-            score += forward_progress * 2
-        if is_clear_path:  # 路线清晰加分
-            score += 1
-        if is_in_opponent_half(teammate_pos):  # 在对方半场加分
-            score += 1
+        # 检查接球队友周围的空间
+        teammate_space = get_space_around_player(obs, i)
         
-        # 距离适中的传球更好
-        from ..gfootball_agent.config import Distance
-        if Distance.SHORT_PASS_RANGE * 0.5 < pass_distance < Distance.SHORT_PASS_RANGE:
-            score += 0.5
+        # 获取队友角色
+        teammate_role = obs['left_team_roles'][i]
+        
+        # 综合评分 - 大幅提高前传权重
+        score = 0
+        
+        # 1. 向前传球奖励（显著提高权重）
+        if forward_progress > 0:
+            score += forward_progress * 5  # 从2提高到5
+            
+            # 对于显著的前传给予额外奖励
+            if forward_progress > 0.2:
+                score += 3
+            elif forward_progress > 0.1:
+                score += 1.5
+                
+        # 2. 严厉惩罚回传，特别是在己方半场
+        elif forward_progress < 0:
+            penalty = abs(forward_progress) * 3  # 回传惩罚
+            if is_in_own_half(player_pos):  # 在己方半场回传惩罚更重
+                penalty *= 2
+            score -= penalty
+            
+        # 3. 高价值目标奖励
+        if teammate_role == PlayerRole.CENTRAL_FORWARD:
+            score += 2.5  # 传给前锋高奖励
+        elif teammate_role == PlayerRole.ATTACK_MIDFIELD:
+            score += 2.0  # 传给攻击中场
+        elif teammate_role in [PlayerRole.LEFT_MIDFIELD, PlayerRole.RIGHT_MIDFIELD]:
+            if is_in_opponent_half(teammate_pos):
+                score += 1.5  # 传给在前场的边路中场
+                
+        # 4. 路线清晰性
+        if is_clear_path:
+            score += 1.5  # 提高清晰路线的奖励
+        else:
+            score -= 1.0  # 路线不清晰的惩罚
+            
+        # 5. 队友周围空间奖励
+        score += teammate_space * 2  # 空间越大奖励越高
+        
+        # 6. 在对方半场的位置奖励
+        if is_in_opponent_half(teammate_pos):
+            score += 2.0  # 提高在对方半场的奖励
+            
+        # 7. 距离因素优化
+        from src.gfootball_agent.config import Distance
+        if pass_distance < Distance.SHORT_PASS_RANGE:
+            if Distance.SHORT_PASS_RANGE * 0.3 < pass_distance < Distance.SHORT_PASS_RANGE * 0.8:
+                score += 0.8  # 适中距离的短传
+        elif pass_distance < Distance.LONG_PASS_RANGE:
+            if forward_progress > 0.3:  # 只有显著前传的长传才有奖励
+                score += 1.0
+                
+        # 8. 避免传给受压的队友
+        closest_opp_to_teammate, dist_to_closest_opp = find_closest_opponent(obs, i)
+        if dist_to_closest_opp < Distance.PRESSURE_DISTANCE * 1.5:
+            score -= 2.0  # 队友受压惩罚
         
         if score > best_score:
             best_score = score
             best_target = i
     
     return best_target
+
+
+def get_space_around_player(obs, player_index):
+    """计算球员周围的空间大小"""
+    player_pos = obs['left_team'][player_index]
+    
+    # 计算最近对手的距离
+    min_distance_to_opponent = float('inf')
+    for opp_pos in obs['right_team']:
+        dist = distance_to(player_pos, opp_pos)
+        if dist < min_distance_to_opponent:
+            min_distance_to_opponent = dist
+    
+    # 将距离转换为空间评分（0-1）
+    max_useful_distance = 0.15  # 超过这个距离就认为空间很好了
+    space_score = min(min_distance_to_opponent / max_useful_distance, 1.0)
+    
+    return space_score
+
+
+def check_dribble_space(obs, player_index, direction_vector=None):
+    """
+    检查球员前方是否有盘带空间
+    
+    参数:
+        obs: 观测数据
+        player_index: 球员索引
+        direction_vector: 期望前进的方向向量，None表示向前
+    
+    返回:
+        (has_space, distance_to_obstacle): 是否有空间，到障碍的距离
+    """
+    player_pos = obs['left_team'][player_index]
+    
+    # 默认向前（向对方球门方向）
+    if direction_vector is None:
+        direction_vector = [1.0, 0.0]  # 向右（对方球门方向）
+    
+    # 标准化方向向量
+    direction_norm = np.linalg.norm(direction_vector)
+    if direction_norm == 0:
+        return False, 0.0
+    
+    direction_unit = np.array(direction_vector) / direction_norm
+    
+    # 检查前方锥形区域
+    cone_angle = 30  # 度
+    cone_distance = 0.1  # 检查距离
+    min_safe_distance = 0.05  # 最小安全距离
+    
+    # 计算锥形的边界向量
+    angle_rad = math.radians(cone_angle / 2)
+    left_boundary = [
+        direction_unit[0] * math.cos(angle_rad) - direction_unit[1] * math.sin(angle_rad),
+        direction_unit[0] * math.sin(angle_rad) + direction_unit[1] * math.cos(angle_rad)
+    ]
+    right_boundary = [
+        direction_unit[0] * math.cos(-angle_rad) - direction_unit[1] * math.sin(-angle_rad),
+        direction_unit[0] * math.sin(-angle_rad) + direction_unit[1] * math.cos(-angle_rad)
+    ]
+    
+    # 检查锥形区域内是否有对手
+    min_distance_to_opponent = float('inf')
+    
+    for opp_pos in obs['right_team']:
+        # 计算到对手的向量
+        to_opponent = np.array(opp_pos) - np.array(player_pos)
+        distance_to_opp = np.linalg.norm(to_opponent)
+        
+        if distance_to_opp == 0:
+            continue
+        
+        # 检查对手是否在锥形范围内
+        to_opponent_unit = to_opponent / distance_to_opp
+        
+        # 计算与方向向量的角度
+        dot_product = np.dot(to_opponent_unit, direction_unit)
+        if dot_product > math.cos(angle_rad):  # 在锥形范围内
+            if distance_to_opp < cone_distance:
+                min_distance_to_opponent = min(min_distance_to_opponent, distance_to_opp)
+    
+    # 判断是否有足够空间
+    has_space = min_distance_to_opponent > min_safe_distance
+    
+    return has_space, min_distance_to_opponent
+
+
+def is_safe_to_clear_ball(obs, player_index):
+    """
+    判断是否应该解围（在危险区域且没有好的传球选择）
+    
+    参数:
+        obs: 观测数据
+        player_index: 球员索引
+    
+    返回:
+        should_clear: 是否应该解围
+    """
+    player_pos = obs['left_team'][player_index]
+    
+    # 检查是否在危险区域（己方禁区或接近禁区）
+    danger_zone_x = Field.LEFT_GOAL_X + 0.2  # 禁区 + 缓冲区
+    is_in_danger_zone = player_pos[0] < danger_zone_x
+    
+    if not is_in_danger_zone:
+        return False
+    
+    # 检查是否被对手紧逼
+    closest_opp_idx, closest_opp_dist = find_closest_opponent(obs, player_index)
+    from src.gfootball_agent.config import Distance
+    is_under_pressure = closest_opp_dist < Distance.PRESSURE_DISTANCE * 1.5
+    
+    if not is_under_pressure:
+        return False
+    
+    # 检查是否有安全的传球选择
+    safe_pass_found = False
+    
+    for i, teammate_pos in enumerate(obs['left_team']):
+        if i == player_index or not obs['left_team_active'][i]:
+            continue
+        
+        # 不能传给守门员（如果自己不是守门员）
+        teammate_role = obs['left_team_roles'][i]
+        if teammate_role == PlayerRole.GOALKEEPER and obs['left_team_roles'][player_index] != PlayerRole.GOALKEEPER:
+            continue
+        
+        # 检查队友是否在安全位置
+        teammate_to_goal_dist = distance_to(teammate_pos, [Field.LEFT_GOAL_X, Field.CENTER_Y])
+        player_to_goal_dist = distance_to(player_pos, [Field.LEFT_GOAL_X, Field.CENTER_Y])
+        
+        # 队友不能比自己更接近球门（避免乌龙球）
+        if teammate_to_goal_dist < player_to_goal_dist:
+            continue
+        
+        # 检查传球距离和路线
+        pass_distance = distance_to(player_pos, teammate_pos)
+        if pass_distance < Distance.SHORT_PASS_RANGE:
+            if check_pass_path_clear(player_pos, teammate_pos, obs['right_team']):
+                safe_pass_found = True
+                break
+    
+    # 如果没有安全传球选择，应该解围
+    return not safe_pass_found
+
+
+def get_clearance_target_position():
+    """获取解围的目标位置（对方半场边路）"""
+    # 选择对方半场的边路位置
+    import random
+    
+    target_x = 0.6 + random.random() * 0.3  # 对方半场
+    target_y = (0.3 + random.random() * 0.1) * (1 if random.random() > 0.5 else -1)  # 边路
+    
+    return [target_x, target_y]
 
 
 def check_pass_path_clear(start_pos, end_pos, opponent_positions, threshold=0.05):
@@ -238,7 +441,7 @@ def get_goalkeeper_position(ball_pos):
 
 def get_defender_position(ball_pos, player_role, obs):
     """计算后卫的防守位置"""
-    from ..gfootball_agent.config import Tactics
+    from src.gfootball_agent.config import Tactics
     
     # 防线的X坐标基于球的位置动态调整
     defensive_x = min(ball_pos[0] - 0.1, Tactics.MID_BLOCK_X_THRESHOLD)
@@ -258,7 +461,7 @@ def get_defender_position(ball_pos, player_role, obs):
 
 def get_midfielder_defensive_position(ball_pos, player_role, obs):
     """计算中场球员的防守位置"""
-    from ..gfootball_agent.config import Tactics
+    from src.gfootball_agent.config import Tactics
     
     # 中场防守位置稍微靠前
     defensive_x = ball_pos[0] - 0.05
@@ -277,7 +480,7 @@ def get_midfielder_defensive_position(ball_pos, player_role, obs):
 
 def is_player_tired(obs, player_index):
     """判断球员是否疲劳"""
-    from ..gfootball_agent.config import Tactics
+    from src.gfootball_agent.config import Tactics
     return obs['left_team_tired_factor'][player_index] > Tactics.TIRED_THRESHOLD
 
 
@@ -315,4 +518,161 @@ def get_movement_direction(current_pos, target_pos):
     elif -67.5 <= angle_degrees < -22.5:
         return Action.TOP_RIGHT
     
-    return Action.IDLE 
+    return Action.IDLE
+
+
+def debug_field_visualization(obs, title="球场站位"):
+    """
+    在命令行输出球场站位示意图
+    
+    参数:
+        obs: 环境观测数据
+        title: 显示标题
+    
+    说明:
+        - 数字 0-10: 左队球员（我方）
+        - 字母 A-K: 右队球员（对方）
+        - *: 球的位置
+        - |: 球门
+        - .: 空地
+    """
+    # 球场ASCII艺术尺寸
+    field_width = 80  # 字符宽度
+    field_height = 30  # 字符高度
+    
+    # 创建空球场
+    field = [['.' for _ in range(field_width)] for _ in range(field_height)]
+    
+    # 添加球门
+    goal_top = field_height // 2 - 2
+    goal_bottom = field_height // 2 + 2
+    for y in range(goal_top, goal_bottom + 1):
+        field[y][0] = '|'  # 左球门
+        field[y][field_width - 1] = '|'  # 右球门
+    
+    # 添加中线
+    center_x = field_width // 2
+    for y in range(field_height):
+        field[y][center_x] = '|'
+    
+    # 添加边界线
+    for x in range(field_width):
+        field[0][x] = '-'  # 上边界
+        field[field_height - 1][x] = '-'  # 下边界
+    
+    def world_to_field_coords(world_x, world_y):
+        """将世界坐标转换为球场ASCII坐标"""
+        # 世界坐标范围: x[-1,1], y[-0.42,0.42]
+        # 转换到球场坐标: x[1,field_width-2], y[1,field_height-2]
+        field_x = int((world_x - Field.LEFT_BOUNDARY) / 
+                     (Field.RIGHT_BOUNDARY - Field.LEFT_BOUNDARY) * 
+                     (field_width - 2)) + 1
+        field_y = int((world_y - Field.TOP_BOUNDARY) / 
+                     (Field.BOTTOM_BOUNDARY - Field.TOP_BOUNDARY) * 
+                     (field_height - 2)) + 1
+        
+        # 确保坐标在有效范围内
+        field_x = max(1, min(field_width - 2, field_x))
+        field_y = max(1, min(field_height - 2, field_y))
+        
+        return field_x, field_y
+    
+    # 添加球的位置
+    ball_pos = obs['ball'][:2]  # 只取x,y坐标
+    ball_x, ball_y = world_to_field_coords(ball_pos[0], ball_pos[1])
+    field[ball_y][ball_x] = '*'
+    
+    # 添加左队球员（我方）- 用数字0-10表示
+    for i, player_pos in enumerate(obs['left_team']):
+        if obs['left_team_active'][i]:  # 只显示活跃球员
+            px, py = world_to_field_coords(player_pos[0], player_pos[1])
+            # 如果球员位置与球重合，显示球员编号
+            if field[py][px] == '*':
+                field[py][px] = str(i)  # 球员优先显示
+            elif field[py][px] == '.':
+                field[py][px] = str(i)
+    
+    # 添加右队球员（对方）- 用字母A-K表示
+    opponent_symbols = 'ABCDEFGHIJK'
+    for i, player_pos in enumerate(obs['right_team']):
+        if obs['right_team_active'][i]:  # 只显示活跃球员
+            px, py = world_to_field_coords(player_pos[0], player_pos[1])
+            symbol = opponent_symbols[i] if i < len(opponent_symbols) else 'X'
+            if field[py][px] == '.':
+                field[py][px] = symbol
+    
+    # 输出球场
+    print(f"\n{title}")
+    print("=" * field_width)
+    print("左球门 ← 我方进攻方向 →  右球门")
+    print("数字0-10: 我方球员, 字母A-K: 对方球员, *: 球")
+    print("-" * field_width)
+    
+    for row in field:
+        print(''.join(row))
+    
+    print("-" * field_width)
+    
+    # 输出详细信息
+    ball_info = get_ball_info(obs)
+    print(f"球位置: ({ball_pos[0]:.3f}, {ball_pos[1]:.3f})")
+    print(f"控球方: {['无人', '我方', '对方'][ball_info['owned_team'] + 1]}")
+    
+    if ball_info['owned_team'] == 0:  # 我方控球
+        print(f"控球球员: {ball_info['owned_player']}")
+    elif ball_info['owned_team'] == 1:  # 对方控球
+        print(f"控球球员: {opponent_symbols[ball_info['owned_player']]}")
+    
+    print(f"比分: {obs['score'][0]} - {obs['score'][1]}")
+    print("=" * field_width)
+
+
+def debug_player_info(obs, player_index=None):
+    """
+    输出球员详细信息
+    
+    参数:
+        obs: 环境观测数据
+        player_index: 指定球员索引，None则显示所有球员
+    """
+    role_names = {
+        PlayerRole.GOALKEEPER: "守门员",
+        PlayerRole.CENTRE_BACK: "中后卫", 
+        PlayerRole.LEFT_BACK: "左后卫",
+        PlayerRole.RIGHT_BACK: "右后卫",
+        PlayerRole.DEFENCE_MIDFIELD: "防守中场",
+        PlayerRole.CENTRAL_MIDFIELD: "中中场",
+        PlayerRole.LEFT_MIDFIELD: "左中场",
+        PlayerRole.RIGHT_MIDFIELD: "右中场",
+        PlayerRole.ATTACK_MIDFIELD: "攻击中场",
+        PlayerRole.CENTRAL_FORWARD: "中锋"
+    }
+    
+    print("\n我方球员信息:")
+    print("-" * 60)
+    
+    if player_index is not None:
+        # 显示指定球员信息
+        players_to_show = [player_index]
+    else:
+        # 显示所有球员信息
+        players_to_show = range(11)
+    
+    for i in players_to_show:
+        if obs['left_team_active'][i]:
+            player_info = get_player_info(obs, i)
+            role_name = role_names.get(player_info['role'], "未知角色")
+            
+            print(f"球员 {i}: {role_name}")
+            print(f"  位置: ({player_info['position'][0]:.3f}, {player_info['position'][1]:.3f})")
+            print(f"  方向: ({player_info['direction'][0]:.3f}, {player_info['direction'][1]:.3f})")
+            print(f"  疲劳度: {player_info['tired_factor']:.3f}")
+            print(f"  活跃状态: {'是' if player_info['active'] else '否'}")
+            
+            # 计算与球的距离
+            ball_pos = obs['ball'][:2]
+            dist_to_ball = distance_to(player_info['position'], ball_pos)
+            print(f"  距球距离: {dist_to_ball:.3f}")
+            print()
+    
+    print("-" * 60) 

@@ -48,37 +48,132 @@ def goalkeeper_offensive_logic(obs, player_index, ball_info, player_info):
 
 
 def goalkeeper_with_ball_logic(obs, player_index, ball_info, player_info):
-    """守门员持球时的决策逻辑"""
+    """守门员持球时的决策逻辑 - 优化版本，避免危险传球"""
     player_pos = player_info['position']
     
-    # 寻找最佳传球目标
-    best_target = get_best_pass_target(obs, player_index)
+    # 检查是否被对手紧逼
+    closest_opponent_idx, closest_opponent_dist = find_closest_opponent(obs, player_index)
+    is_under_pressure = closest_opponent_dist < Distance.PRESSURE_DISTANCE
+    
+    # 如果受压，优先检查是否应该解围
+    if is_under_pressure:
+        from src.utils.features import is_safe_to_clear_ball, get_clearance_target_position
+        if is_safe_to_clear_ball(obs, player_index):
+            # 解围到对方半场边路
+            return Action.LONG_PASS
+    
+    # 寻找安全的传球目标
+    best_target = get_safe_goalkeeper_pass_target(obs, player_index)
     
     if best_target != -1:
         target_pos = obs['left_team'][best_target]
         pass_distance = distance_to(player_pos, target_pos)
+        target_role = obs['left_team_roles'][best_target]
         
-        # 检查是否有对手逼抢
-        closest_opponent_idx, closest_opponent_dist = find_closest_opponent(obs, player_index)
+        # 检查目标队友是否也受压
+        target_closest_opp_idx, target_closest_opp_dist = find_closest_opponent(obs, best_target)
+        target_under_pressure = target_closest_opp_dist < Distance.PRESSURE_DISTANCE * 1.2
         
-        # 如果被紧逼，优先快速出球
-        if closest_opponent_dist < Distance.PRESSURE_DISTANCE:
-            # 紧急情况，长传到安全区域
-            if pass_distance > Distance.LONG_PASS_RANGE * 0.5:
-                return Action.LONG_PASS
-            else:
-                return Action.SHORT_PASS
+        # 如果目标队友受压，考虑其他选择
+        if target_under_pressure and not is_under_pressure:
+            # 守门员没受压但队友受压，寻找其他目标或长传
+            alternative_target = find_alternative_pass_target(obs, player_index, exclude=[best_target])
+            if alternative_target != -1:
+                return Action.LONG_PASS  # 长传给替代目标
         
-        # 正常情况下的传球选择
-        if pass_distance < Distance.SHORT_PASS_RANGE:
-            # 短传给后卫
+        # 正常传球决策
+        if pass_distance < Distance.SHORT_PASS_RANGE and not target_under_pressure:
+            # 短传给后卫（确保后卫不受压）
             return Action.SHORT_PASS
-        else:
+        elif target_role in [PlayerRole.CENTRAL_MIDFIELD, PlayerRole.LEFT_MIDFIELD, PlayerRole.RIGHT_MIDFIELD]:
             # 长传到中场
             return Action.LONG_PASS
     
     # 没有好的传球选择，持球移动寻找机会
     return goalkeeper_move_with_ball(obs, player_index, player_info)
+
+
+def get_safe_goalkeeper_pass_target(obs, player_index):
+    """为守门员寻找安全的传球目标，避免乌龙球"""
+    player_pos = obs['left_team'][player_index]
+    
+    best_target = -1
+    best_score = -1
+    
+    for i, teammate_pos in enumerate(obs['left_team']):
+        if i == player_index or not obs['left_team_active'][i]:
+            continue
+        
+        teammate_role = obs['left_team_roles'][i]
+        
+        # 计算基础安全评分
+        score = 0
+        
+        # 1. 绝对不传给距离己方球门更近的队友（防止乌龙球）
+        teammate_to_goal_dist = distance_to(teammate_pos, [Field.LEFT_GOAL_X, Field.CENTER_Y])
+        keeper_to_goal_dist = distance_to(player_pos, [Field.LEFT_GOAL_X, Field.CENTER_Y])
+        
+        if teammate_to_goal_dist <= keeper_to_goal_dist + 0.02:  # 加小的缓冲
+            continue  # 跳过太接近球门的队友
+        
+        # 2. 队友距离己方球门越远越安全
+        score += teammate_to_goal_dist * 3
+        
+        # 3. 优先传给后卫
+        if teammate_role in [PlayerRole.CENTRE_BACK, PlayerRole.LEFT_BACK, PlayerRole.RIGHT_BACK]:
+            score += 2.0
+        elif teammate_role in [PlayerRole.CENTRAL_MIDFIELD, PlayerRole.LEFT_MIDFIELD, PlayerRole.RIGHT_MIDFIELD]:
+            score += 1.5
+        
+        # 4. 检查队友周围的空间
+        from src.utils.features import get_space_around_player
+        teammate_space = get_space_around_player(obs, i)
+        score += teammate_space * 2
+        
+        # 5. 传球距离因素
+        pass_distance = distance_to(player_pos, teammate_pos)
+        if Distance.SHORT_PASS_RANGE * 0.5 < pass_distance < Distance.SHORT_PASS_RANGE * 1.2:
+            score += 1.0  # 适中距离
+        
+        # 6. 检查传球路线是否清晰
+        from src.utils.features import check_pass_path_clear
+        if check_pass_path_clear(player_pos, teammate_pos, obs['right_team']):
+            score += 1.5
+        else:
+            score -= 1.0
+        
+        # 7. 避免传给在边线的队友（容易失误）
+        if abs(teammate_pos[1]) > 0.35:
+            score -= 0.5
+        
+        if score > best_score:
+            best_score = score
+            best_target = i
+    
+    return best_target
+
+
+def find_alternative_pass_target(obs, player_index, exclude=None):
+    """寻找替代的传球目标"""
+    if exclude is None:
+        exclude = []
+    
+    player_pos = obs['left_team'][player_index]
+    
+    for i, teammate_pos in enumerate(obs['left_team']):
+        if i == player_index or i in exclude or not obs['left_team_active'][i]:
+            continue
+        
+        # 寻找在中场的队友
+        teammate_role = obs['left_team_roles'][i]
+        if teammate_role in [PlayerRole.CENTRAL_MIDFIELD, PlayerRole.LEFT_MIDFIELD, PlayerRole.RIGHT_MIDFIELD]:
+            # 检查是否在相对安全的位置
+            if teammate_pos[0] > Field.CENTER_X - 0.2:  # 在中场或前场
+                closest_opp_idx, closest_opp_dist = find_closest_opponent(obs, i)
+                if closest_opp_dist > Distance.PRESSURE_DISTANCE:
+                    return i
+    
+    return -1
 
 
 def goalkeeper_move_with_ball(obs, player_index, player_info):

@@ -42,7 +42,7 @@ def midfielder_offensive_logic(obs, player_index, ball_info, player_info):
 
 
 def midfielder_with_ball_logic(obs, player_index, ball_info, player_info):
-    """中场球员持球时的决策逻辑"""
+    """中场球员持球时的决策逻辑 - 优化版本，增加盘带优先级"""
     player_pos = player_info['position']
     player_role = player_info['role']
     
@@ -58,6 +58,41 @@ def midfielder_with_ball_logic(obs, player_index, ball_info, player_info):
     # 如果被紧逼，快速处理球
     if closest_opponent_dist < Distance.PRESSURE_DISTANCE:
         return midfielder_under_pressure(obs, player_index, ball_info, player_info)
+    
+    # 优先检查盘带机会（在传球之前）
+    from src.utils.features import check_dribble_space
+    has_dribble_space, space_distance = check_dribble_space(obs, player_index)
+    
+    # 在对方半场有空间时，积极盘带
+    if has_dribble_space and space_distance > 0.06:
+        should_dribble = False
+        
+        # 在对方半场更积极盘带
+        if is_in_opponent_half(player_pos):
+            should_dribble = True
+        # 攻击型中场即使在己方半场也要积极
+        elif player_role == PlayerRole.ATTACK_MIDFIELD and space_distance > 0.08:
+            should_dribble = True
+        # 边路中场在边路有空间时积极盘带
+        elif player_role in [PlayerRole.LEFT_MIDFIELD, PlayerRole.RIGHT_MIDFIELD]:
+            if abs(player_pos[1]) > 0.15 and space_distance > 0.07:
+                should_dribble = True
+        
+        # 比较盘带和传球价值
+        if not should_dribble:
+            best_target = get_best_pass_target(obs, player_index)
+            if best_target != -1:
+                target_pos = obs['left_team'][best_target]
+                forward_progress = target_pos[0] - player_pos[0]
+                # 如果传球前进不明显，优先盘带
+                if forward_progress < 0.08:
+                    should_dribble = True
+            else:
+                # 没有好的传球选择，优先盘带
+                should_dribble = True
+        
+        if should_dribble:
+            return midfielder_dribble_logic(obs, player_index, player_info)
     
     # 寻找最佳传球机会
     best_target = get_best_pass_target(obs, player_index)

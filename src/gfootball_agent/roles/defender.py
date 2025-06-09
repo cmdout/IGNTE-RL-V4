@@ -7,7 +7,7 @@ from src.utils.features import (
     get_defensive_position, find_closest_teammate,
     find_closest_opponent, get_best_pass_target,
     get_movement_direction, is_player_tired,
-    is_in_opponent_half, can_shoot
+    is_in_opponent_half, can_shoot, debug_field_visualization
 )
 from src.utils.actions import action_manager, validate_action_for_situation
 from src.gfootball_agent.config import Action, Distance, Field, PlayerRole, Tactics
@@ -47,7 +47,7 @@ def defender_offensive_logic(obs, player_index, ball_info, player_info):
 
 
 def defender_with_ball_logic(obs, player_index, ball_info, player_info):
-    """后卫持球时的决策逻辑"""
+    """后卫持球时的决策逻辑 - 优化版本，优先考虑盘带"""
     player_pos = player_info['position']
     player_role = player_info['role']
     
@@ -58,8 +58,42 @@ def defender_with_ball_logic(obs, player_index, ball_info, player_info):
     if closest_opponent_dist < Distance.PRESSURE_DISTANCE:
         return defender_under_pressure(obs, player_index, ball_info, player_info)
     
+    # 优先检查前方是否有盘带空间
+    from src.utils.features import check_dribble_space
+    has_dribble_space, space_distance = check_dribble_space(obs, player_index)
+    
+    # 如果前方有空间且不在危险区域，优先盘带
+    danger_zone_x = Field.LEFT_GOAL_X + 0.15  # 禁区附近为危险区域
+    if has_dribble_space and player_pos[0] > danger_zone_x:
+        # 检查盘带是否比传球更有价值
+        best_target = get_best_pass_target(obs, player_index)
+        
+        should_dribble = False
+        
+        if best_target == -1:
+            # 没有好的传球选择，果断盘带
+            should_dribble = True
+        else:
+            # 比较盘带和传球的价值
+            target_pos = obs['left_team'][best_target]
+            forward_progress_pass = target_pos[0] - player_pos[0]
+            
+            # 如果传球的前进幅度不大，优先盘带
+            if forward_progress_pass < 0.12:  # 传球前进不明显
+                should_dribble = True
+            
+            # 边后卫在边路有空间时，积极盘带助攻
+            if player_role in [PlayerRole.LEFT_BACK, PlayerRole.RIGHT_BACK]:
+                if abs(player_pos[1]) > 0.15 and space_distance > 0.08:
+                    should_dribble = True
+        
+        if should_dribble:
+            return defender_dribble_forward(obs, player_index, player_info)
+    
     # 寻找最佳传球目标
     best_target = get_best_pass_target(obs, player_index)
+
+    # debug_field_visualization(obs, title="后卫持球时的决策逻辑")
     
     if best_target != -1:
         target_pos = obs['left_team'][best_target]
@@ -83,26 +117,70 @@ def defender_with_ball_logic(obs, player_index, ball_info, player_info):
 
 
 def defender_under_pressure(obs, player_index, ball_info, player_info):
-    """后卫被逼抢时的处理"""
+    """后卫被逼抢时的处理 - 优化版本，避免乌龙球"""
     player_pos = player_info['position']
     
-    # 寻找最近的安全传球目标
+    # 首先检查是否在危险区域，应该解围
+    from src.utils.features import is_safe_to_clear_ball
+    if is_safe_to_clear_ball(obs, player_index):
+        # 解围到对方半场边路
+        return Action.HIGH_PASS  # 高球解围
+    
+    # 寻找安全的传球目标，严格避免乌龙球
     best_target = -1
-    min_risk = float('inf')
+    best_score = -1
     
     for i, teammate_pos in enumerate(obs['left_team']):
         if i == player_index or not obs['left_team_active'][i]:
             continue
         
-        # 计算传球风险（距离对手的远近）
-        closest_opp_to_teammate, dist_to_opp = find_closest_opponent(obs, i)
+        teammate_role = obs['left_team_roles'][i]
         
-        if dist_to_opp < min_risk:
-            min_risk = dist_to_opp
+        # 计算安全评分
+        score = 0
+        
+        # 1. 绝对不传给守门员（除非自己是守门员）
+        if teammate_role == PlayerRole.GOALKEEPER and player_info['role'] != PlayerRole.GOALKEEPER:
+            continue
+        
+        # 2. 绝对不传给比自己更接近球门的队友
+        teammate_to_goal_dist = distance_to(teammate_pos, [Field.LEFT_GOAL_X, Field.CENTER_Y])
+        player_to_goal_dist = distance_to(player_pos, [Field.LEFT_GOAL_X, Field.CENTER_Y])
+        
+        if teammate_to_goal_dist <= player_to_goal_dist + 0.02:
+            continue  # 跳过太接近球门的队友
+        
+        # 3. 队友距离对手的远近（安全性）
+        closest_opp_to_teammate, dist_to_opp = find_closest_opponent(obs, i)
+        score += dist_to_opp * 5  # 距离对手越远越安全
+        
+        # 4. 队友距离球门越远越安全
+        score += teammate_to_goal_dist * 3
+        
+        # 5. 优先传给边路队友（边路相对安全）
+        if abs(teammate_pos[1]) > 0.2:
+            score += 1.0
+        
+        # 6. 不要传给Y位置太接近的队友（可能造成拥挤）
+        if abs(teammate_pos[1] - player_pos[1]) < 0.1:
+            score -= 0.5
+        
+        # 7. 传球距离不能太远（紧急情况）
+        pass_distance = distance_to(player_pos, teammate_pos)
+        if pass_distance > Distance.SHORT_PASS_RANGE * 1.5:
+            score -= 1.0
+        
+        # 8. 检查传球路线
+        from src.utils.features import check_pass_path_clear
+        if not check_pass_path_clear(player_pos, teammate_pos, obs['right_team']):
+            score -= 2.0  # 路线不清晰严重扣分
+        
+        if score > best_score:
+            best_score = score
             best_target = i
     
-    # 紧急传球
-    if best_target != -1:
+    # 有安全的传球目标
+    if best_target != -1 and best_score > 0:
         target_pos = obs['left_team'][best_target]
         pass_distance = distance_to(player_pos, target_pos)
         
@@ -111,8 +189,8 @@ def defender_under_pressure(obs, player_index, ball_info, player_info):
         else:
             return Action.LONG_PASS
     
-    # 实在没办法，尝试向边路大脚解围
-    return Action.LONG_PASS
+    # 没有安全传球目标，必须解围
+    return Action.HIGH_PASS  # 高球解围到前场
 
 
 def defender_dribble_forward(obs, player_index, player_info):

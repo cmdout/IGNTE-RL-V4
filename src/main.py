@@ -10,9 +10,9 @@ import time
 def create_environment(args):
     """创建Google Research Football环境"""
     env = football_env.create_environment(
-        env_name=args.env_name,
-        representation=args.representation,
-        rewards=args.rewards,
+        env_name='11_vs_11_stochastic',
+        representation='raw',
+        rewards='scoring',
         write_goal_dumps=False,
         write_full_episode_dumps=False,
         render=args.render,
@@ -75,7 +75,7 @@ def run_episode(env, max_steps=3000):
         obs, rewards, done, info = env.step(actions)
         
         # 计算奖励
-        time.sleep(0.1)
+        # time.sleep(0.1)
         total_reward = sum(rewards) / 11
         episode_reward += total_reward
         episode_length += 1
