@@ -67,15 +67,9 @@ sudo apt-get install python3-opencv
 
 ### 基本运行
 ```bash
-cd src
 python run.py
 ```
 
-### 直接运行
-```bash
-cd src  
-python main.py
-```
 
 ### 自定义环境参数
 修改`main.py`中的`create_environment()`函数:
