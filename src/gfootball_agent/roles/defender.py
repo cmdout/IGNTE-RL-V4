@@ -5,11 +5,11 @@ import numpy as np
 
 from src.utils.features import (
     get_ball_info, get_player_info, distance_to, 
-    get_defensive_position, find_closest_teammate,
+    get_defensive_position,
     find_closest_opponent, get_best_pass_target,
     get_movement_direction, is_player_tired,
-    is_in_opponent_half, can_shoot, debug_field_visualization,
-    calculate_shot_angle, distance_to_line, check_pass_path_clear, # Added for utility functions
+    is_in_opponent_half, can_shoot,
+    check_pass_path_clear, # Added for utility functions
     check_dribble_space, is_safe_to_clear_ball # Added for utility functions
 )
 from src.utils.actions import action_manager, validate_action_for_situation

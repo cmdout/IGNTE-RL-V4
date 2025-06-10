@@ -7,10 +7,10 @@ from src.utils.features import (
     get_ball_info, get_player_info, distance_to,
     get_midfielder_defensive_position, find_closest_teammate,
     find_closest_opponent, get_best_pass_target,
-    get_movement_direction, is_player_tired,
-    is_in_opponent_half, can_shoot, is_in_own_half,
-    is_offside_position, check_pass_path_clear,
-    calculate_shot_angle, distance_to_line, check_dribble_space # Added for utility functions
+    get_movement_direction, is_offside_position, is_player_tired,
+    is_in_opponent_half, can_shoot,
+    check_pass_path_clear,
+    distance_to_line, check_dribble_space # Added for utility functions
 )
 from src.utils.actions import action_manager, validate_action_for_situation
 from src.gfootball_agent.config import Action, Distance, Field, PlayerRole, Tactics

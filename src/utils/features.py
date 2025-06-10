@@ -7,6 +7,14 @@ import math
 from src.gfootball_agent.config import Field, PlayerRole, Distance
 
 
+def is_offside_position(obs, position):
+    """简单的越位判断"""
+    # 找到最后一名对方防守球员的位置
+    last_defender_x = min(opp_pos[0] for opp_pos in obs['right_team'])
+    
+    # 如果前锋位置超过最后一名防守球员，可能越位
+    return position[0] > last_defender_x - 0.02
+
 def distance_to(pos1, pos2):
     """计算两个位置之间的欧几里得距离"""
     return np.linalg.norm(np.array(pos1) - np.array(pos2))
@@ -639,7 +647,8 @@ def get_movement_direction(current_pos, target_pos):
     direction_norm = np.linalg.norm(direction)
     
     if direction_norm < 0.01:  # 已经很接近目标位置
-        return None
+        from src.gfootball_agent.config import Action
+        return Action.IDLE  # 返回IDLE而不是None
     
     # 标准化方向向量
     direction_unit = direction / direction_norm

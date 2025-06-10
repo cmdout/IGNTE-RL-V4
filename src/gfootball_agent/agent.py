@@ -52,32 +52,27 @@ class FootballAgent:
         返回:
             action: 球员应该执行的动作
         """
-        try:
-            # 调用顶层决策逻辑获取期望动作
-            desired_action = get_player_action(obs, player_index)
+        # 调用顶层决策逻辑获取期望动作
+        desired_action = get_player_action(obs, player_index)
+        
+        # 验证动作的合法性
+        is_valid, corrected_action = validate_action_for_situation(
+            desired_action, obs, player_index
+        )
+        
+        if not is_valid:
+            desired_action = corrected_action
+        
+        # 通过动作管理器处理粘性动作
+        final_action = action_manager.get_action_with_sticky_management(
+            player_index, desired_action, obs
+        )
+        
+        # 记录动作历史
+        self._record_action_history(player_index, final_action)
+        
+        return final_action
             
-            # 验证动作的合法性
-            is_valid, corrected_action = validate_action_for_situation(
-                desired_action, obs, player_index
-            )
-            
-            if not is_valid:
-                desired_action = corrected_action
-            
-            # 通过动作管理器处理粘性动作
-            final_action = action_manager.get_action_with_sticky_management(
-                player_index, desired_action, obs
-            )
-            
-            # 记录动作历史
-            self._record_action_history(player_index, final_action)
-            
-            return final_action
-            
-        except Exception as e:
-            # 出现异常时返回安全的默认动作
-            print(f"球员 {player_index} 决策出现异常: {e}")
-            return 0  # IDLE
     
     def _record_action_history(self, player_index, action):
         """

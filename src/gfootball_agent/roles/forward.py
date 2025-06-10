@@ -8,9 +8,7 @@ from src.utils.features import (
     find_closest_teammate, find_closest_opponent,
     get_best_pass_target, get_movement_direction,
     is_player_tired, is_in_opponent_half, can_shoot,
-    check_pass_path_clear, distance_to_line, # Added for new score function
-    is_offside_position, calculate_shot_angle, # Added for new score function
-    find_defensive_gap, calculate_optimal_y_position # Added for new attacking run
+    check_pass_path_clear, distance_to_line, is_offside_position, # Added for new score function
 )
 from src.utils.actions import action_manager, validate_action_for_situation
 from src.gfootball_agent.config import Action, Distance, Field, PlayerRole
@@ -457,8 +455,9 @@ def forward_attacking_run(obs, player_index, player_info, ball_pos):
             
             if movement_action:
                 return movement_action
-            # else: # movement_action is None (should not happen if distance > 0.02)
-            #    return Action.IDLE
+            else:
+                # 防御性编程：如果movement_action为None，返回IDLE
+                return Action.IDLE
 
     # Fallback logic if no good receiving position from find_best_receiving_position_enhanced
     # or if ball_carrier is not valid.
@@ -473,6 +472,9 @@ def forward_attacking_run(obs, player_index, player_info, ball_pos):
                     if distance_to(player_pos, target_position_gap) > 0.1 and not is_player_tired(obs, player_index, fatigue_threshold=None):
                         return Action.SPRINT
                     return movement_action
+                else:
+                    # 防御性编程：如果movement_action为None，返回IDLE
+                    return Action.IDLE
 
     # Further fallback: Maintain a generally threatening position if other heuristics don't yield a good move.
     # Move towards an area slightly ahead of the ball, off-center to create options.
@@ -510,6 +512,9 @@ def forward_attacking_run(obs, player_index, player_info, ball_pos):
         movement_action = get_movement_direction(player_pos, final_target_pos)
         if movement_action:
             return movement_action
+        else:
+            # 防御性编程：如果movement_action为None，返回IDLE
+            return Action.IDLE
 
     return Action.IDLE
 
@@ -534,8 +539,9 @@ def forward_counter_attack_run(obs, player_index, player_info, ball_pos):
     
     if movement_action:
         return movement_action
-    
-    return Action.IDLE
+    else:
+        # 防御性编程：如果movement_action为None，返回IDLE
+        return Action.IDLE
 
 
 def forward_defensive_logic(obs, player_index, ball_info, player_info):
@@ -553,8 +559,9 @@ def forward_defensive_logic(obs, player_index, ball_info, player_info):
     
     if movement_action:
         return movement_action
-    
-    return Action.IDLE
+    else:
+        # 防御性编程：如果movement_action为None，返回IDLE
+        return Action.IDLE
 
 
 def forward_pressure_logic(obs, player_index, ball_info, player_info):
@@ -573,6 +580,9 @@ def forward_pressure_logic(obs, player_index, ball_info, player_info):
         movement_action = get_movement_direction(player_pos, ball_pos)
         if movement_action:
             return movement_action
+        else:
+            # 防御性编程：如果movement_action为None，返回IDLE
+            return Action.IDLE
     
     return Action.IDLE
 
@@ -590,6 +600,9 @@ def forward_contention_logic(obs, player_index, ball_info, player_info):
             movement_action = get_movement_direction(player_pos, ball_pos)
             if movement_action:
                 return movement_action
+            else:
+                # 防御性编程：如果movement_action为None，返回IDLE
+                return Action.IDLE
         else:
             # 冲刺向球
             if not is_player_tired(obs, player_index, fatigue_threshold=None):
@@ -601,8 +614,9 @@ def forward_contention_logic(obs, player_index, ball_info, player_info):
     
     if movement_action:
         return movement_action
-    
-    return Action.IDLE
+    else:
+        # 防御性编程：如果movement_action为None，返回IDLE
+        return Action.IDLE
 
 
 def can_dribble_towards_goal(obs, player_index, player_pos):
@@ -895,7 +909,10 @@ def find_defensive_gap(obs, player_index, ball_pos):
             defenders.append(opp_pos)
     
     if len(defenders) < 2:
-        return None
+        # 如果防守球员不足，返回一个默认的前插位置，而不是None
+        default_x = min(ball_pos[0] + 0.1, Field.RIGHT_GOAL_X - 0.15)
+        default_y = ball_pos[1] * 0.5  # 轻微跟随球的横向位置
+        return [default_x, default_y]
     
     # 寻找防守队员之间的空隙
     gaps = []
@@ -930,6 +947,12 @@ def find_defensive_gap(obs, player_index, ball_pos):
         if score > best_score:
             best_score = score
             best_gap = gap_center
+    
+    # 如果没有找到合适的空隙，返回默认位置
+    if best_gap is None:
+        default_x = min(ball_pos[0] + 0.08, Field.RIGHT_GOAL_X - 0.15)
+        default_y = 0  # 中路位置
+        return [default_x, default_y]
     
     return best_gap
 
@@ -967,14 +990,6 @@ def is_too_crowded_ahead(obs, ball_pos):
     
     return crowded_area_count >= 3
 
-
-def is_offside_position(obs, position):
-    """简单的越位判断"""
-    # 找到最后一名对方防守球员的位置
-    last_defender_x = min(opp_pos[0] for opp_pos in obs['right_team'])
-    
-    # 如果前锋位置超过最后一名防守球员，可能越位
-    return position[0] > last_defender_x - 0.02
 
 
 def calculate_shot_angle(position, goal_center):
