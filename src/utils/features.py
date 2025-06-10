@@ -4,7 +4,7 @@
 
 import numpy as np
 import math
-from src.gfootball_agent.config import Field, PlayerRole
+from src.gfootball_agent.config import Field, PlayerRole, Distance
 
 
 def distance_to(pos1, pos2):
@@ -27,6 +27,27 @@ def angle_to_goal(player_pos, goal_x=Field.RIGHT_GOAL_X):
     # 计算与X轴正方向的角度
     angle = math.atan2(direction_vector[1], direction_vector[0])
     return math.degrees(angle)
+
+
+def distance_to_line(p1, p2, p3):
+    """Calculate distance from point p3 to line segment [p1, p2]."""
+    # p1, p2, p3 are expected to be numpy arrays
+    if np.array_equal(p1,p2):
+        return np.linalg.norm(p3 - p1) # Line segment is a point
+
+    d = np.linalg.norm(np.cross(p2 - p1, p1 - p3)) / np.linalg.norm(p2 - p1)
+
+    # Check if the projection of p3 onto the line defined by p1 and p2
+    # falls within the segment [p1, p2].
+    dot_p1_p3 = np.dot(p3 - p1, p2 - p1)
+    if dot_p1_p3 <= 0: # p3 projects outside segment, beyond p1
+        return np.linalg.norm(p3 - p1)
+
+    dot_p2_p3 = np.dot(p3 - p2, p1 - p2)
+    if dot_p2_p3 <= 0: # p3 projects outside segment, beyond p2
+        return np.linalg.norm(p3 - p2)
+
+    return d
 
 
 def get_ball_info(obs):
@@ -122,14 +143,25 @@ def can_shoot(player_pos, ball_pos, obs):
     return True
 
 
-def get_best_pass_target(obs, player_index):
-    """找到最佳的传球目标 - 优化版本，更加激进的前传"""
+def get_best_pass_target(obs, player_index, game_context=None):
+    """找到最佳的传球目标 - 增强版，考虑助攻潜力、穿透性、风险和游戏情境"""
     player_pos = obs['left_team'][player_index]
-    ball_info = get_ball_info(obs)
+    player_role = obs['left_team_roles'][player_index]
     
     best_target = -1
-    best_score = -1
-    
+    best_score = -float('inf') # Initialize with negative infinity for better comparison
+
+    # Game context parameters (defaults if not provided)
+    # These would ideally be passed via game_context object
+    is_losing_late = False # Example: True if losing in last 15 mins
+    is_winning_late = False # Example: True if winning in last 15 mins
+    is_counter_attack = False # Example: True if just won ball in own half
+
+    # if game_context:
+    #     is_losing_late = game_context.get('is_losing_late', False)
+    #     is_winning_late = game_context.get('is_winning_late', False)
+    #     is_counter_attack = game_context.get('is_counter_attack', False)
+
     for i, teammate_pos in enumerate(obs['left_team']):
         if i == player_index:  # 跳过自己
             continue
@@ -137,81 +169,145 @@ def get_best_pass_target(obs, player_index):
         if not obs['left_team_active'][i]:  # 跳过非活跃球员
             continue
         
-        # 计算传球距离
-        pass_distance = distance_to(player_pos, teammate_pos)
-        
-        # 计算向前推进的程度
-        forward_progress = teammate_pos[0] - player_pos[0]
-        
-        # 检查传球路线是否清晰
-        is_clear_path = check_pass_path_clear(player_pos, teammate_pos, obs['right_team'])
-        
-        # 检查接球队友周围的空间
-        teammate_space = get_space_around_player(obs, i)
-        
-        # 获取队友角色
         teammate_role = obs['left_team_roles'][i]
-        
-        # 综合评分 - 大幅提高前传权重
+        teammate_dir = obs['left_team_direction'][i] # Teammate's facing direction
+
         score = 0
         
-        # 1. 向前传球奖励（显著提高权重）
-        if forward_progress > 0:
-            score += forward_progress * 5  # 从2提高到5
-            
-            # 对于显著的前传给予额外奖励
-            if forward_progress > 0.2:
-                score += 3
-            elif forward_progress > 0.1:
-                score += 1.5
-                
-        # 2. 严厉惩罚回传，特别是在己方半场
-        elif forward_progress < 0:
-            penalty = abs(forward_progress) * 3  # 回传惩罚
-            if is_in_own_half(player_pos):  # 在己方半场回传惩罚更重
-                penalty *= 2
-            score -= penalty
-            
-        # 3. 高价值目标奖励
-        if teammate_role == PlayerRole.CENTRAL_FORWARD:
-            score += 2.5  # 传给前锋高奖励
-        elif teammate_role == PlayerRole.ATTACK_MIDFIELD:
-            score += 2.0  # 传给攻击中场
-        elif teammate_role in [PlayerRole.LEFT_MIDFIELD, PlayerRole.RIGHT_MIDFIELD]:
-            if is_in_opponent_half(teammate_pos):
-                score += 1.5  # 传给在前场的边路中场
-                
-        # 4. 路线清晰性
+        # === Core Pass Attributes ===
+        pass_distance = distance_to(player_pos, teammate_pos)
+        forward_progress = teammate_pos[0] - player_pos[0]
+
+        # === Risk Assessment ===
+        # 1. Path Clarity (already exists, but let's integrate its effect more directly)
+        is_clear_path = check_pass_path_clear(player_pos, teammate_pos, obs['right_team'], threshold=0.04) # Stricter threshold
         if is_clear_path:
-            score += 1.5  # 提高清晰路线的奖励
+            score += 2.5 # Increased bonus for very clear path
         else:
-            score -= 1.0  # 路线不清晰的惩罚
-            
-        # 5. 队友周围空间奖励
-        score += teammate_space * 2  # 空间越大奖励越高
+            score -= 3.0 # Increased penalty for unclear path
+
+        # 2. Pressure on Receiver
+        _closest_opp_to_teammate_idx, dist_to_closest_opp_to_teammate = find_closest_opponent(obs, i)
+        from src.gfootball_agent.config import Distance # Ensure Distance is imported
+        if dist_to_closest_opp_to_teammate < Distance.PRESSURE_DISTANCE * 1.2: # Stricter pressure check
+            score -= 2.5 # Higher penalty if receiver is under immediate pressure
+        elif dist_to_closest_opp_to_teammate < Distance.PRESSURE_DISTANCE * 2.0:
+            score -= 1.0 # Moderate penalty
+
+        # 3. Number of opponents near pass trajectory (more advanced interception risk)
+        opponents_near_path = 0
+        for opp_idx, opp_pos in enumerate(obs['right_team']):
+            if obs['right_team_active'][opp_idx]:
+                # Simplified check: if opponent is close to the midpoint of the pass
+                mid_point_pass = ((player_pos[0] + teammate_pos[0]) / 2, (player_pos[1] + teammate_pos[1]) / 2)
+                if distance_to(opp_pos, mid_point_pass) < pass_distance * 0.4: # Opponent near mid-path
+                     # And also not too far from the direct line
+                    if distance_to_line(np.array(player_pos), np.array(teammate_pos), np.array(opp_pos)) < 0.1:
+                        opponents_near_path += 1
+        score -= opponents_near_path * 1.0 # Penalize for each opponent near the path
+
+
+        # === Reward Assessment ===
+        # 4. Forward Progress (already exists, re-weighting)
+        if forward_progress > 0.02: # Smallest forward progress still useful
+            score += forward_progress * 6.0 # Maintain high reward for forwardness
+            if forward_progress > 0.25: # Significant forward progress
+                score += 4.0
+            elif forward_progress > 0.15:
+                score += 2.0
+        elif forward_progress < -0.05: # More tolerance for small backward passes if they are safe
+            penalty = abs(forward_progress) * 4.0
+            if is_in_own_half(player_pos):
+                penalty *= 2.5 # Heavy penalty for backward passes in own half
+            # Allow very short safe back passes from attackers under pressure
+            if player_role == PlayerRole.CENTRAL_FORWARD and forward_progress > -0.08 and dist_to_closest_opp_to_teammate > Distance.PRESSURE_DISTANCE * 2.0 :
+                penalty = 0 # Forgive short safe back pass for forward
+            score -= penalty
         
-        # 6. 在对方半场的位置奖励
+        # 5. High Value Target (Role-based, already exists, slight re-weight)
+        if teammate_role == PlayerRole.CENTRAL_FORWARD:
+            score += 3.5
+        elif teammate_role == PlayerRole.ATTACK_MIDFIELD:
+            score += 2.5
+        elif teammate_role in [PlayerRole.LEFT_MIDFIELD, PlayerRole.RIGHT_MIDFIELD] and is_in_opponent_half(teammate_pos):
+            score += 2.0
+        elif teammate_role in [PlayerRole.LEFT_BACK, PlayerRole.RIGHT_BACK] and is_in_opponent_half(teammate_pos) and forward_progress > 0.1: # Overlapping run
+             score += 1.5
+
+        # 6. Receiver Space (already exists, re-weight)
+        teammate_space = get_space_around_player(obs, i) # Assuming this returns 0-1 value
+        score += teammate_space * 2.5
+
+        # 7. Position on Field (already exists, re-weight)
         if is_in_opponent_half(teammate_pos):
-            score += 2.0  # 提高在对方半场的奖励
-            
-        # 7. 距离因素优化
-        from src.gfootball_agent.config import Distance
-        if pass_distance < Distance.SHORT_PASS_RANGE:
-            if Distance.SHORT_PASS_RANGE * 0.3 < pass_distance < Distance.SHORT_PASS_RANGE * 0.8:
-                score += 0.8  # 适中距离的短传
-        elif pass_distance < Distance.LONG_PASS_RANGE:
-            if forward_progress > 0.3:  # 只有显著前传的长传才有奖励
+            score += 2.5
+            if teammate_pos[0] > 0.6: # Deep in opponent territory
+                score += 1.5
+
+        # 8. Pass Distance Suitability (already exists, minor adjustments)
+        if pass_distance < Distance.SHORT_PASS_RANGE * 0.8: # Good short pass
+             if Distance.SHORT_PASS_RANGE * 0.2 < pass_distance : # Not too short
                 score += 1.0
-                
-        # 8. 避免传给受压的队友
-        closest_opp_to_teammate, dist_to_closest_opp = find_closest_opponent(obs, i)
-        if dist_to_closest_opp < Distance.PRESSURE_DISTANCE * 1.5:
-            score -= 2.0  # 队友受压惩罚
-        
+        elif pass_distance < Distance.LONG_PASS_RANGE * 0.8: # Good long pass
+            if forward_progress > 0.25: # Prefer long passes to be significantly forward
+                score += 1.5
+            else:
+                score -= 0.5 # Discourage long sideways/backward passes unless very strategic
+        else: # Too long pass
+            score -= 2.0
+
+
+        # === New Scoring Components ===
+        # 9. Assist Potential
+        # Check if the receiver is in a good shooting position or can easily get into one
+        if is_in_opponent_half(teammate_pos):
+            dist_receiver_to_goal = distance_to(teammate_pos, [Field.RIGHT_GOAL_X, Field.CENTER_Y])
+            if dist_receiver_to_goal < Distance.SHOT_RANGE:
+                # Simplified check for being able to shoot soon
+                # A more complex check would involve `can_shoot` for the teammate from `teammate_pos`
+                score += 3.0
+                if teammate_role == PlayerRole.CENTRAL_FORWARD:
+                    score += 1.5 # Extra for forward in shooting pos
+            if dist_receiver_to_goal < Distance.OPTIMAL_SHOT_RANGE:
+                score += 2.0
+
+
+        # 10. Line Breaking Pass
+        # Check if the pass crosses a 'line' of opponents.
+        # Simplified: if pass starts behind an opponent and ends in front of them significantly.
+        # Or if it moves the ball from one third of the pitch to another bypassing opponents.
+        num_opp_bypassed = 0
+        for opp_idx, opp_pos in enumerate(obs['right_team']):
+            if obs['right_team_active'][opp_idx]:
+                # If opponent is between passer and receiver along X-axis, and pass goes beyond them
+                if min(player_pos[0], teammate_pos[0]) < opp_pos[0] < max(player_pos[0], teammate_pos[0]):
+                    # And opponent is reasonably close to the direct line of the pass
+                    if distance_to_line(np.array(player_pos), np.array(teammate_pos), np.array(opp_pos)) < 0.2: # 0.2 is a wider corridor
+                        num_opp_bypassed +=1
+        if num_opp_bypassed > 0 and forward_progress > 0.1: # Must be a forward pass
+            score += num_opp_bypassed * 1.5
+
+
+        # 11. Receiver Readiness (e.g., facing opponent goal)
+        # Player direction is a vector [x, y]. If x > 0, mostly facing opponent goal.
+        if teammate_dir[0] > 0.1 and is_in_opponent_half(teammate_pos): # Facing generally towards opponent goal
+            score += 1.0
+        elif teammate_dir[0] < -0.1 and is_in_own_half(teammate_pos): # Facing own goal in own half (bad)
+            score -= 0.5
+
+
+        # === Contextual Adjustments (Examples) ===
+        # if is_counter_attack and forward_progress > 0.2:
+        #    score *= 1.5 # Amplify scores for good forward passes in counter attacks
+        # if is_winning_late and forward_progress < 0 and teammate_space > 0.8:
+        #    score += 2.0 # Safer possession passes when winning late are more valuable
+        # if is_losing_late and forward_progress > 0.1:
+        #    score *= 1.3 # More desperate for forward passes
+
         if score > best_score:
             best_score = score
             best_target = i
-    
+
     return best_target
 
 
@@ -396,6 +492,37 @@ def check_pass_path_clear(start_pos, end_pos, opponent_positions, threshold=0.05
     return True
 
 
+def calculate_dynamic_defensive_line_x(obs, base_mid_block_x_threshold):
+    """Calculates a dynamic X coordinate for the defensive line."""
+    ball_pos_x = obs['ball'][0]
+    # score_diff = obs['score'][0] - obs['score'][1] # Our score - Opponent score
+    # steps_remaining = 3000 - obs['steps_left'] # Approximation, if steps_left is from 3000 to 0
+
+    dynamic_threshold = base_mid_block_x_threshold
+
+    # 1. Adjust based on ball position
+    if ball_pos_x > 0.5: # Ball deep in opponent half
+        dynamic_threshold = base_mid_block_x_threshold + 0.15 # Push up significantly
+    elif ball_pos_x > 0.0: # Ball in opponent half, near center
+        dynamic_threshold = base_mid_block_x_threshold + 0.08
+    elif ball_pos_x < -0.7: # Ball very deep in our half
+        dynamic_threshold = base_mid_block_x_threshold - 0.1 # Drop deeper
+    elif ball_pos_x < -0.4: # Ball in our defensive third
+        dynamic_threshold = base_mid_block_x_threshold - 0.05
+
+    # Placeholder for game state adjustments (e.g. score, time)
+    # if is_winning_late (e.g. score_diff > 0 and steps_remaining < 600):
+    #     dynamic_threshold -= 0.07 # Drop deeper by an additional amount
+    # elif is_losing_late (e.g. score_diff < 0 and steps_remaining < 600):
+    #     dynamic_threshold += 0.07 # Push up more
+
+    # Ensure line doesn't go past center too much, or too deep
+    dynamic_threshold = min(dynamic_threshold, Field.CENTER_X + 0.1) # Max push up
+    dynamic_threshold = max(dynamic_threshold, Field.LEFT_GOAL_X + 0.25) # Min depth (don't sit on GK)
+
+    return dynamic_threshold
+
+
 def get_defensive_position(obs, player_index):
     """计算防守位置"""
     ball_pos = get_ball_info(obs)['position']
@@ -439,49 +566,71 @@ def get_goalkeeper_position(ball_pos):
     return keeper_pos.tolist()
 
 
-def get_defender_position(ball_pos, player_role, obs):
-    """计算后卫的防守位置"""
-    from src.gfootball_agent.config import Tactics
+def get_defender_position(ball_pos, player_role, obs): # obs is needed now
+    """计算后卫的防守位置 - 使用动态防线"""
+    from src.gfootball_agent.config import Tactics # Keep import local
     
-    # 防线的X坐标基于球的位置动态调整
-    defensive_x = min(ball_pos[0] - 0.1, Tactics.MID_BLOCK_X_THRESHOLD)
-    defensive_x = max(defensive_x, Field.LEFT_GOAL_X + 0.15)  # 不能太靠近自己球门
+    # Calculate dynamic defensive line X
+    base_threshold = Tactics.MID_BLOCK_X_THRESHOLD
+    # Pass the full obs to the dynamic line calculation function
+    defensive_x = calculate_dynamic_defensive_line_x(obs, base_threshold)
     
-    # 根据球员角色确定Y坐标
+    # Original logic for Y spread based on role
     if player_role == PlayerRole.LEFT_BACK:
-        defensive_y = -Tactics.DEFENSIVE_LINE_Y_SPREAD / 2
+        defensive_y = -Tactics.DEFENSIVE_LINE_Y_SPREAD / 2.0 # Use float division
     elif player_role == PlayerRole.RIGHT_BACK:
-        defensive_y = Tactics.DEFENSIVE_LINE_Y_SPREAD / 2
+        defensive_y = Tactics.DEFENSIVE_LINE_Y_SPREAD / 2.0
     else:  # 中后卫
-        # 中后卫根据球的Y位置调整
-        defensive_y = ball_pos[1] * 0.3  # 轻微跟随球的Y位置
-    
-    return [defensive_x, defensive_y]
+        defensive_y = ball_pos[1] * 0.4 # Slightly more reactive to ball Y for CBs
+        defensive_y = np.clip(defensive_y, -0.15, 0.15) # Keep CBs relatively central
+
+    # Final position, ensuring defenders don't get pushed too far from their base X due to ball_pos[0] effect in old code
+    # The dynamic_X already considers ball_pos, so direct use is fine.
+    # However, ensure it's not excessively deep.
+    final_x = max(defensive_x, Field.LEFT_GOAL_X + 0.18) # Min depth for defenders
+    return [final_x, defensive_y]
 
 
-def get_midfielder_defensive_position(ball_pos, player_role, obs):
-    """计算中场球员的防守位置"""
-    from src.gfootball_agent.config import Tactics
+def get_midfielder_defensive_position(ball_pos, player_role, obs): # obs is needed now
+    """计算中场球员的防守位置 - 使用动态防线"""
+    from src.gfootball_agent.config import Tactics # Keep import local
+
+    base_threshold = Tactics.MID_BLOCK_X_THRESHOLD
+    # Midfielders sit slightly ahead of the defensive line or at the same dynamic line
+    # Let's use a slightly more advanced X for midfielders than the pure defensive line.
+    defensive_line_x = calculate_dynamic_defensive_line_x(obs, base_threshold)
     
-    # 中场防守位置稍微靠前
-    defensive_x = ball_pos[0] - 0.05
-    defensive_x = max(defensive_x, Tactics.MID_BLOCK_X_THRESHOLD)
-    
-    # 根据球员角色调整Y位置
+    midfield_x = defensive_line_x + 0.05 # Midfielders generally 0.05 ahead of calculated def line
+    midfield_x = min(midfield_x, ball_pos[0] - 0.03) # But should stay behind or very close to ball
+    midfield_x = max(midfield_x, defensive_line_x) # Cannot be behind the main defensive line
+    midfield_x = min(midfield_x, Field.CENTER_X + 0.3) # Don't push too far up when 'defending'
+
+    # Original Y logic for midfielders
     if player_role == PlayerRole.LEFT_MIDFIELD:
-        defensive_y = -0.2
+        defensive_y = -0.25 # Slightly wider for wing midfielders
     elif player_role == PlayerRole.RIGHT_MIDFIELD:
-        defensive_y = 0.2
-    else:  # 中中场
-        defensive_y = ball_pos[1] * 0.5  # 更多地跟随球的位置
-    
-    return [defensive_x, defensive_y]
+        defensive_y = 0.25
+    elif player_role == PlayerRole.DEFENCE_MIDFIELD: # DMF specific
+        midfield_x = defensive_line_x + 0.02 # DMF closer to defensive line
+        defensive_y = ball_pos[1] * 0.4
+        defensive_y = np.clip(defensive_y, -0.2, 0.2)
+    else:  # CENTRAL_MIDFIELD, ATTACK_MIDFIELD (when defending)
+        defensive_y = ball_pos[1] * 0.5
+        defensive_y = np.clip(defensive_y, -0.25, 0.25)
+        if player_role == PlayerRole.ATTACK_MIDFIELD: # AM can be a bit higher
+            midfield_x = min(defensive_line_x + 0.1, ball_pos[0] - 0.02)
 
 
-def is_player_tired(obs, player_index):
+    final_x = max(midfield_x, Field.LEFT_GOAL_X + 0.28) # Min depth for midfielders
+    return [final_x, defensive_y]
+
+
+def is_player_tired(obs, player_index, fatigue_threshold=None): # Added fatigue_threshold
     """判断球员是否疲劳"""
-    from src.gfootball_agent.config import Tactics
-    return obs['left_team_tired_factor'][player_index] > Tactics.TIRED_THRESHOLD
+    from src.gfootball_agent.config import Tactics # Keep import local if only used here
+
+    threshold_to_use = fatigue_threshold if fatigue_threshold is not None else Tactics.TIRED_THRESHOLD
+    return obs['left_team_tired_factor'][player_index] > threshold_to_use
 
 
 def get_movement_direction(current_pos, target_pos):

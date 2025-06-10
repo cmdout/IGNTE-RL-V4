@@ -1,16 +1,125 @@
 """
 后卫的决策逻辑
 """ 
+import numpy as np
 
 from src.utils.features import (
     get_ball_info, get_player_info, distance_to, 
     get_defensive_position, find_closest_teammate,
     find_closest_opponent, get_best_pass_target,
     get_movement_direction, is_player_tired,
-    is_in_opponent_half, can_shoot, debug_field_visualization
+    is_in_opponent_half, can_shoot, debug_field_visualization,
+    calculate_shot_angle, distance_to_line, check_pass_path_clear, # Added for utility functions
+    check_dribble_space, is_safe_to_clear_ball # Added for utility functions
 )
 from src.utils.actions import action_manager, validate_action_for_situation
 from src.gfootball_agent.config import Action, Distance, Field, PlayerRole, Tactics
+
+
+def _evaluate_shot_utility_def(obs, player_index, player_pos, ball_pos, player_role):
+    """Evaluates the utility of taking a shot for a defender. Should be extremely low."""
+    # Defenders generally should not shoot.
+    # Only consider if player is somehow extremely far up and in a miracle situation.
+    if player_pos[0] > 0.6 and can_shoot(player_pos, ball_pos, obs): # Very advanced for a defender
+        # Extremely basic utility, still very low to discourage it.
+        distance_to_goal = distance_to(player_pos, [Field.RIGHT_GOAL_X, Field.CENTER_Y])
+        if distance_to_goal < Distance.SHOT_RANGE:
+            return 1.0 - (distance_to_goal * 5), Action.SHOT # Tiny utility
+    return -float('inf'), None
+
+
+def _evaluate_pass_utility_def(obs, player_index, player_pos, player_role):
+    """Evaluates the utility of making a pass for a defender."""
+    best_target_index = get_best_pass_target(obs, player_index)
+
+    if best_target_index == -1:
+        return -float('inf'), None
+
+    utility = 10.0 # Base utility: passing is default good action for defenders
+    teammate_pos = obs['left_team'][best_target_index]
+    teammate_role = obs['left_team_roles'][best_target_index]
+    pass_distance = distance_to(player_pos, teammate_pos)
+    forward_progress = teammate_pos[0] - player_pos[0]
+
+    # Safety is paramount for defenders
+    _ , dist_to_closest_opp_to_receiver = find_closest_opponent(obs, best_target_index)
+    if dist_to_closest_opp_to_receiver < Distance.PRESSURE_DISTANCE * 1.5: # Receiver under some pressure
+        utility -= 5.0
+    if dist_to_closest_opp_to_receiver < Distance.BALL_CLOSE: # Receiver under heavy pressure
+        utility -= 10.0
+
+    # Path clarity
+    if not check_pass_path_clear(player_pos, teammate_pos, obs['right_team'], threshold=0.035): # Stricter for defenders
+        utility -= 8.0
+
+    # Prefer passes to midfielders or fullbacks if building out
+    if teammate_role in [PlayerRole.CENTRAL_MIDFIELD, PlayerRole.DEFENCE_MIDFIELD, PlayerRole.ATTACK_MIDFIELD, PlayerRole.LEFT_MIDFIELD, PlayerRole.RIGHT_MIDFIELD]:
+        utility += 3.0
+    elif teammate_role in [PlayerRole.LEFT_BACK, PlayerRole.RIGHT_BACK] and teammate_role != player_role: # Pass to other fullback
+        utility += 2.0
+    elif teammate_role == PlayerRole.GOALKEEPER: # Backpass to GK
+        if player_pos[0] < Field.LEFT_GOAL_X + 0.2: # Only if deep and GK is clear
+             _ , gk_opp_dist = find_closest_opponent(obs, best_target_index)
+             if gk_opp_dist > 0.15 : utility += 1.0 # Risky, small utility
+             else: utility -= 10.0 # Very risky
+        else: utility -= 5.0 # Generally avoid passing back to GK from higher up
+    elif teammate_role == PlayerRole.CENTRAL_FORWARD: # Long ball to forward
+        if forward_progress > 0.3 and pass_distance > 0.3: # Must be a clear long ball
+            utility += 1.0 # Small bonus, can be an option
+        else:
+            utility -= 3.0 # Short passes to heavily marked forward by defender is usually bad
+
+    # Penalize risky forward passes from deep
+    if forward_progress > 0.1 and player_pos[0] < -0.5: # Forward pass from deep defense
+        utility -= (forward_progress * 15.0) # Moderate penalty, prefer safer build-up
+
+    pass_action = Action.SHORT_PASS
+    if pass_distance > Distance.SHORT_PASS_RANGE:
+        if forward_progress > 0.25 and teammate_role == PlayerRole.CENTRAL_FORWARD : # Long ball to forward
+            pass_action = Action.HIGH_PASS
+        elif forward_progress > 0.15 : # Other constructive long passes
+            pass_action = Action.LONG_PASS
+        else: # Long sideways/backward passes from defenders are usually not great unless clearing
+            utility -= (pass_distance - Distance.SHORT_PASS_RANGE) * 10
+            pass_action = Action.LONG_PASS # Default to long if it's far.
+
+    # MIN_VIABLE_PASS_UTILITY_DEF - defenders should try to make a pass if one is remotely sensible
+    MIN_VIABLE_PASS_UTILITY_DEF = -5.0 # Can be negative if it's better than losing ball
+    if utility < MIN_VIABLE_PASS_UTILITY_DEF and not (pass_action == Action.HIGH_PASS and forward_progress > 0.3) : # Exception for clearances
+         return -float('inf'), None # Not a good pass
+
+    return utility, pass_action
+
+
+def _evaluate_dribble_utility_def(obs, player_index, player_pos, player_role):
+    """Evaluates the utility of dribbling for a defender."""
+    utility = 0.0
+    _ , closest_opp_dist = find_closest_opponent(obs, player_index)
+
+    if closest_opp_dist < Distance.BALL_CLOSE * 1.1: utility -= 10.0 # Very risky
+    elif closest_opp_dist < Distance.PRESSURE_DISTANCE * 0.9: utility -= 7.0
+    else: utility += 1.0 # Some space is a small plus, but not primary goal
+
+    has_fwd_space, space_dist = check_dribble_space(obs, player_index, direction_vector=[0.1,0.0])
+    if has_fwd_space and space_dist > 0.1: # Significant clear space ahead
+        utility += 3.0
+        if player_role in [PlayerRole.LEFT_BACK, PlayerRole.RIGHT_BACK] and abs(player_pos[1]) > 0.15: # Fullbacks on flank
+            utility += 2.0
+    else: # No clear forward space
+        utility -= 3.0
+
+    if player_role == PlayerRole.CENTRE_BACK:
+        utility -= 5.0 # CBs strongly discouraged from dribbling
+
+    # If player is very deep in own half, dribbling is extra risky
+    if player_pos[0] < Field.LEFT_GOAL_X + 0.2:
+        utility -= 4.0
+
+    MIN_VIABLE_DRIBBLE_UTILITY_DEF = -2.0 # Defender dribble must be clearly safe or better than terrible pass
+    if utility < MIN_VIABLE_DRIBBLE_UTILITY_DEF:
+         return -float('inf'), None
+
+    return utility, Action.DRIBBLE
 
 
 def defender_decision(obs, player_index):
@@ -47,73 +156,51 @@ def defender_offensive_logic(obs, player_index, ball_info, player_info):
 
 
 def defender_with_ball_logic(obs, player_index, ball_info, player_info):
-    """后卫持球时的决策逻辑 - 优化版本，优先考虑盘带"""
+    """后卫持球时的决策逻辑 - 基于效用评估"""
     player_pos = player_info['position']
+    ball_pos = player_info['position']
     player_role = player_info['role']
-    
-    # 检查是否被对手逼抢
-    closest_opponent_idx, closest_opponent_dist = find_closest_opponent(obs, player_index)
-    
-    # 如果被紧逼，优先安全出球
-    if closest_opponent_dist < Distance.PRESSURE_DISTANCE:
-        return defender_under_pressure(obs, player_index, ball_info, player_info)
-    
-    # 优先检查前方是否有盘带空间
-    from src.utils.features import check_dribble_space
-    has_dribble_space, space_distance = check_dribble_space(obs, player_index)
-    
-    # 如果前方有空间且不在危险区域，优先盘带
-    danger_zone_x = Field.LEFT_GOAL_X + 0.15  # 禁区附近为危险区域
-    if has_dribble_space and player_pos[0] > danger_zone_x:
-        # 检查盘带是否比传球更有价值
-        best_target = get_best_pass_target(obs, player_index)
-        
-        should_dribble = False
-        
-        if best_target == -1:
-            # 没有好的传球选择，果断盘带
-            should_dribble = True
-        else:
-            # 比较盘带和传球的价值
-            target_pos = obs['left_team'][best_target]
-            forward_progress_pass = target_pos[0] - player_pos[0]
-            
-            # 如果传球的前进幅度不大，优先盘带
-            if forward_progress_pass < 0.12:  # 传球前进不明显
-                should_dribble = True
-            
-            # 边后卫在边路有空间时，积极盘带助攻
-            if player_role in [PlayerRole.LEFT_BACK, PlayerRole.RIGHT_BACK]:
-                if abs(player_pos[1]) > 0.15 and space_distance > 0.08:
-                    should_dribble = True
-        
-        if should_dribble:
-            return defender_dribble_forward(obs, player_index, player_info)
-    
-    # 寻找最佳传球目标
-    best_target = get_best_pass_target(obs, player_index)
 
-    # debug_field_visualization(obs, title="后卫持球时的决策逻辑")
+    # If under severe pressure, the original defender_under_pressure is good (prioritizes safety/clearance)
+    _ , closest_opponent_dist = find_closest_opponent(obs, player_index)
+    if closest_opponent_dist < Distance.PRESSURE_DISTANCE * 0.8 : # Very tight pressure
+        # print(f"Defender {player_index} under severe pressure, using original logic.")
+        return defender_under_pressure(obs, player_index, ball_info, player_info) # Original handles this well
+
+    # Evaluate options if not under extreme immediate pressure
+    # Shot utility is practically nil for defenders, but we can call it for completeness.
+    shot_utility, shot_action = _evaluate_shot_utility_def(obs, player_index, player_pos, ball_pos, player_role)
+    pass_utility, pass_action = _evaluate_pass_utility_def(obs, player_index, player_pos, player_role)
+    dribble_utility, dribble_action = _evaluate_dribble_utility_def(obs, player_index, player_pos, player_role)
     
-    if best_target != -1:
-        target_pos = obs['left_team'][best_target]
-        pass_distance = distance_to(player_pos, target_pos)
-        target_role = obs['left_team_roles'][best_target]
-        
-        # 优先向前传球
-        forward_progress = target_pos[0] - player_pos[0]
-        
-        if forward_progress > 0.1:  # 显著向前的传球
-            if pass_distance < Distance.SHORT_PASS_RANGE:
-                return Action.SHORT_PASS
-            else:
-                return Action.HIGH_PASS  # 高球传向前场
-        elif pass_distance < Distance.SHORT_PASS_RANGE:
-            # 横传或回传
-            return Action.SHORT_PASS
+    # print(f"P{player_index}({player_role}) Utils: Shot={shot_utility:.1f}, Pass={pass_utility:.1f}, Dribble={dribble_utility:.1f}")
+
+    # Defenders: Pass > Safe Dribble > Clearance (High Pass) > Risky Dribble / Bad Pass > Shot
+    MIN_COMMIT_THRESHOLD_DEF_PASS = 0.0 # Prefer any decent pass
+    MIN_COMMIT_THRESHOLD_DEF_DRIBBLE = 1.0 # Dribble needs some positive utility
+
+    if pass_utility >= dribble_utility and pass_utility > MIN_COMMIT_THRESHOLD_DEF_PASS:
+        return pass_action
+    # Consider dribble only if it's clearly better than a bad pass or no pass
+    elif dribble_utility > pass_utility and dribble_utility > MIN_COMMIT_THRESHOLD_DEF_DRIBBLE :
+        # Use existing defender_dribble_forward for controlled dribbling
+        return defender_dribble_forward(obs, player_index, player_info)
+    elif pass_utility > -float('inf') and pass_action is not None: # Fallback to any available pass
+        return pass_action
     
-    # 没有好的传球选择，带球前进寻找机会
-    return defender_dribble_forward(obs, player_index, player_info)
+    # If no good pass or dribble, and not under EXTREME pressure (handled above),
+    # but still might be risky, consider a clearance type high pass.
+    # The _evaluate_pass_utility_def might return a HIGH_PASS with decent utility if it's a long forward clearance.
+    # If pass_utility was low but action was HIGH_PASS, it might be a clearance attempt.
+    if pass_action == Action.HIGH_PASS and pass_utility > -3.0 : # Low utility but it's a clearance
+        return Action.HIGH_PASS
+
+    # Ultimate fallback: if original defender_under_pressure wasn't triggered but situation is still bad.
+    # This could be a less immediate pressure but no good options.
+    if is_safe_to_clear_ball(obs, player_index): # from features.py
+         return Action.HIGH_PASS
+
+    return defender_dribble_forward(obs, player_index, player_info) # Last resort: try to carry forward a bit.
 
 
 def defender_under_pressure(obs, player_index, ball_info, player_info):
@@ -250,7 +337,7 @@ def defender_defensive_logic(obs, player_index, ball_info, player_info):
         # 如果需要快速回防，使用冲刺
         if (distance_to_target > 0.1 and 
             ball_pos[0] > player_pos[0] and  # 球在前方
-            not is_player_tired(obs, player_index)):
+            not is_player_tired(obs, player_index, fatigue_threshold=None)):
             return Action.SPRINT
         
         if movement_action:
@@ -279,7 +366,7 @@ def defender_pressure_logic(obs, player_index, ball_info, player_info):
             return movement_action
     
     # 冲刺接近球
-    if distance_to_ball > 0.05 and not is_player_tired(obs, player_index):
+    if distance_to_ball > 0.05 and not is_player_tired(obs, player_index, fatigue_threshold=None):
         return Action.SPRINT
     
     # 正常速度接近
@@ -358,7 +445,7 @@ def defender_attacking_movement(obs, player_index, player_info):
     movement_action = get_movement_direction(player_pos, target_pos)
     
     # 积极前进，使用冲刺
-    if distance_to(player_pos, target_pos) > 0.1 and not is_player_tired(obs, player_index):
+    if distance_to(player_pos, target_pos) > 0.1 and not is_player_tired(obs, player_index, fatigue_threshold=None):
         return Action.SPRINT
     
     if movement_action:
@@ -387,39 +474,79 @@ def defender_support_movement(obs, player_index, player_info):
 
 
 def should_defender_pressure(obs, player_index, ball_pos):
-    """判断后卫是否应该上抢"""
-    player_pos = obs['left_team'][player_index]
-    
-    # 检查是否是离球最近的后卫
-    min_distance = float('inf')
-    closest_defender = -1
-    
-    for i, pos in enumerate(obs['left_team']):
-        role = obs['left_team_roles'][i]
-        if role in [PlayerRole.CENTRE_BACK, PlayerRole.LEFT_BACK, PlayerRole.RIGHT_BACK]:
-            dist = distance_to(pos, ball_pos)
-            if dist < min_distance:
-                min_distance = dist
-                closest_defender = i
-    
-    return closest_defender == player_index and min_distance < Distance.PRESSURE_DISTANCE * 2
+    """判断后卫是否应该上抢 - 增强版"""
+    player_info = get_player_info(obs, player_index)
+    player_pos = player_info['position']
+    player_role = player_info['role']
+
+    if is_player_tired(obs, player_index, fatigue_threshold=0.8): # Defenders press less when tired
+        return False
+
+    distance_to_ball = distance_to(player_pos, ball_pos)
+
+    # If ball is very far, or defender is CB and ball is wide and not deep, don't press
+    if distance_to_ball > Distance.PRESSURE_DISTANCE * 2.5:
+        return False
+    if player_role == PlayerRole.CENTRE_BACK and abs(ball_pos[1]) > 0.3 and ball_pos[0] > -0.5: # CB less likely to press wide unless ball is deep
+        if distance_to_ball > Distance.PRESSURE_DISTANCE * 1.5:
+             return False
+
+    # Check if this defender is the "designated presser" or has good immediate support
+    # This simplifies to checking if they are clearly the closest or have a nearby defensive partner
+    is_closest_def = is_closest_defender_to_ball(obs, player_index, ball_pos, proximity_factor=1.1)
+
+    if not is_closest_def :
+        # If not the absolute closest, only press if very close and ball is in dangerous spot
+        if not (distance_to_ball < Distance.BALL_CLOSE and ball_pos[0] < Field.LEFT_GOAL_X + 0.3): # Danger zone
+            return False
+
+    # If ball is central and near penalty box, CBs might step up
+    if abs(ball_pos[1]) < 0.20 and ball_pos[0] < Field.LEFT_GOAL_X + 0.25: # Central, ~18yd box edge
+        if distance_to_ball < Distance.PRESSURE_DISTANCE * 1.2:
+            return True
+
+    # Fullbacks can be slightly more aggressive, especially if ball is on their flank
+    if player_role in [PlayerRole.LEFT_BACK, PlayerRole.RIGHT_BACK]:
+        is_ball_on_flank = (ball_pos[1] < -0.15 and player_role == PlayerRole.LEFT_BACK) or                            (ball_pos[1] > 0.15 and player_role == PlayerRole.RIGHT_BACK)
+        if is_ball_on_flank and distance_to_ball < Distance.PRESSURE_DISTANCE * 1.8:
+            return True
+
+    # General condition for CBs or if other conditions not met
+    if distance_to_ball < Distance.PRESSURE_DISTANCE * 1.5:
+        # Check for cover. If no other defender is relatively close behind, be cautious.
+        num_covering_teammates = 0
+        for i, teammate_pos in enumerate(obs['left_team']):
+            if i == player_index or not obs['left_team_active'][i]:
+                continue
+            tm_role = obs['left_team_roles'][i]
+            if tm_role in [PlayerRole.CENTRE_BACK, PlayerRole.LEFT_BACK, PlayerRole.RIGHT_BACK, PlayerRole.DEFENCE_MIDFIELD]:
+                if teammate_pos[0] < player_pos[0] and distance_to(player_pos, teammate_pos) < 0.15:
+                    num_covering_teammates +=1
+
+        if num_covering_teammates > 0 or player_pos[0] < Field.LEFT_GOAL_X + 0.2: # Press if covered or very deep
+            return True
+
+    return False
 
 
-def is_closest_defender_to_ball(obs, player_index, ball_pos):
-    """判断是否是离球最近的后卫"""
+def is_closest_defender_to_ball(obs, player_index, ball_pos, proximity_factor=1.0):
+    """判断是否是离球最近（或接近最近）的后卫"""
     player_pos = obs['left_team'][player_index]
     player_distance = distance_to(player_pos, ball_pos)
+    min_dist_any_defender = player_distance
+
+    defender_roles = [PlayerRole.CENTRE_BACK, PlayerRole.LEFT_BACK, PlayerRole.RIGHT_BACK]
     
     for i, pos in enumerate(obs['left_team']):
-        if i == player_index:
+        if not obs['left_team_active'][i]:
             continue
-        
         role = obs['left_team_roles'][i]
-        if role in [PlayerRole.CENTRE_BACK, PlayerRole.LEFT_BACK, PlayerRole.RIGHT_BACK]:
-            if distance_to(pos, ball_pos) < player_distance:
-                return False
-    
-    return True
+        if role in defender_roles:
+            dist = distance_to(pos, ball_pos)
+            if dist < min_dist_any_defender:
+                min_dist_any_defender = dist
+
+    return player_distance <= min_dist_any_defender * proximity_factor
 
 
 def count_centre_backs_in_position(obs):
