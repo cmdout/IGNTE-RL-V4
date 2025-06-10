@@ -1030,9 +1030,9 @@ def should_forward_pressure(obs, player_index, ball_pos):
     
     # Base condition: Ball in opponent's territory, and forward is reasonably close
     press_condition = False
-    if ball_pos[0] < -0.25 and distance_to_ball < 0.25: # Slightly wider X range, slightly larger distance
+    if ball_pos[0] > 0.25 and distance_to_ball < 0.25: # 球在对方半场深处且前锋距离合理
         press_condition = True
-    elif ball_pos[0] < 0.0 and distance_to_ball < 0.15: # Press more aggressively if ball is closer to center in opp half
+    elif ball_pos[0] > 0.0 and distance_to_ball < 0.15: # 球在对方半场且距离较近时更积极逼抢
         press_condition = True
 
     if not press_condition:
@@ -1044,7 +1044,7 @@ def should_forward_pressure(obs, player_index, ball_pos):
         if i == player_index or not obs['left_team_active'][i]:
             continue
         role = obs['left_team_roles'][i]
-        if role in [PlayerRole.CENTRAL_FORWARD, PlayerRole.ATTACK_MIDFIELD] and teammate_pos[0] > -0.5:
+        if role in [PlayerRole.CENTRAL_FORWARD, PlayerRole.ATTACK_MIDFIELD] and teammate_pos[0] > -0.2:  # 队友在相对前场位置
             if distance_to(player_pos, teammate_pos) < 0.3: # Teammate is somewhat nearby
                  num_supporting_attackers +=1
     

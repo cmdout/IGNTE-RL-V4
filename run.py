@@ -18,7 +18,7 @@ def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='Google Research Football 决策树智能体')
 
-    parser.add_argument('--render', action='store_true', default=True,
+    parser.add_argument('--render', action='store_true', default=False,
                        help='启用渲染 (默认: True)')
     parser.add_argument('--write_video', action='store_true', default=False,
                        help='录制视频 (默认: False)')
